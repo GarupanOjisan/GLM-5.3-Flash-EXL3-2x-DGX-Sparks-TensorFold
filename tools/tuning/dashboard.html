@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GLM Spark Metrics</title>
+<style>
+:root{color-scheme:light;--bg:#fcfcfb;--ink:#1f1f1e;--muted:#6b6b68;--grid:#e5e5e2;--s1:#2a78d6;--s2:#eb6834;--tip:#ffffff}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#1a1a19;--ink:#ecece9;--muted:#9a9a96;--grid:#333331;--s1:#3987e5;--s2:#d95926;--tip:#262625}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#1a1a19;--ink:#ecece9;--muted:#9a9a96;--grid:#333331;--s1:#3987e5;--s2:#d95926;--tip:#262625}
+body{margin:0;padding:16px;background:var(--bg);color:var(--ink);font:14px/1.4 system-ui,sans-serif}
+h1{font-size:18px;margin:0 0 4px}.sub{color:var(--muted);margin:0 0 12px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+button{font:inherit;padding:4px 10px;border:1px solid var(--grid);background:transparent;color:var(--ink);border-radius:6px;cursor:pointer}
+button[aria-pressed=true]{border-color:var(--s1);color:var(--s1)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px}
+.card{border:1px solid var(--grid);border-radius:8px;padding:10px 12px}
+.card h2{font-size:13px;font-weight:600;margin:0 0 2px}.card .u{color:var(--muted);font-size:12px;margin:0 0 6px}
+.leg{display:flex;gap:12px;font-size:12px;color:var(--muted);margin-bottom:4px}.leg i{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;margin-right:4px}
+svg{width:100%;height:auto;display:block;overflow:visible}
+.tip{position:fixed;pointer-events:none;background:var(--tip);border:1px solid var(--grid);border-radius:6px;padding:6px 8px;font-size:12px;display:none;white-space:nowrap}
+</style></head><body>
+<h1>GLM-5.3-Flash on 2× DGX Spark</h1>
+<p class="sub" id="sub">読み込み中</p>
+<div class="bar"><span>期間</span><button data-h="6">6 時間</button><button data-h="24" aria-pressed="true">24 時間</button><button data-h="168">7 日</button><button data-h="720">30 日</button><span id="st" style="color:var(--muted)"></span></div>
+<div class="grid" id="g"></div><div class="tip" id="tip"></div>
+<script>
+const K=["requests_total","prompt_tokens_total","cached_tokens_total","prefill_seconds_total","completion_tokens_total","decode_seconds_total","accepted_total","drafted_total","rounds_total"];
+const days=n=>{const a=[];for(let i=0;i<=n;i++){const d=new Date(Date.now()-i*864e5);a.push(d.toISOString().slice(0,10))}return a};
+async function text(u){const r=await fetch(u,{cache:"no-store"});return r.ok?r.text():""}
+async function load(hours){
+  const ds=days(Math.ceil(hours/24)), t0=Date.now()/1e3-hours*3600;
+  const H=[],G1=[],G2=[];
+  for(const d of ds){
+    for(const l of (await text(`health-${d}.jsonl`)).split("\n")) if(l){try{const r=JSON.parse(l);if(r.ts>=t0)H.push(r)}catch(e){}}
+    for(const [arr,p] of [[G1,""],[G2,"spark2/"]]) for(const l of (await text(`${p}gpu-${d}.csv`)).split("\n")) if(l){const c=l.split(",");if(+c[0]>=t0)arr.push({ts:+c[0],clk:+c[1],w:+c[2],t:+c[3],used:+c[5],free:+c[6]})}
+  }
+  H.sort((a,b)=>a.ts-b.ts);G1.sort((a,b)=>a.ts-b.ts);G2.sort((a,b)=>a.ts-b.ts);return {H,G1,G2,t0,t1:Date.now()/1e3};
+}
+// bucket: width so that ~150 points fill the range
+function buckets(t0,t1){const n=150,w=Math.max(60,Math.round((t1-t0)/n/60)*60);const b=[];for(let t=Math.floor(t0/w)*w;t<t1;t+=w)b.push({t,w,n:0,c:{}});return b}
+function fillHealth(B,H){
+  let prev=null;const w=B[0].w;
+  for(const r of H){const b=B[Math.floor((r.ts-B[0].t)/w)];if(!b)continue;b.n++;b.inflight=(b.inflight||0)+r.h.requests_running;b.poolfree=r.h.pool_free_tokens;b.pool=r.h.pool_tokens;b.kept=r.h.kept_prompts;
+    if(prev&&r.h.requests_total>=prev.requests_total)for(const k of K)b.c[k]=(b.c[k]||0)+r.h[k]-prev[k];else if(prev)b.restart=true;prev=r.h}
+}
+function fillGpu(B,G,key){const w=B[0].w;for(const r of G){const b=B[Math.floor((r.ts-B[0].t)/w)];if(!b)continue;(b[key]=b[key]||{clk:[],w:[],t:[],free:[]});for(const k in b[key])b[key][k].push(r[k])}}
+const avg=a=>a&&a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
+const S=(B,f)=>B.map(b=>{const v=f(b);return v==null||!isFinite(v)?null:v});
+function series(B){
+  const c=k=>b=>b.c[k]||0, req=b=>b.c.requests_total||0;
+  return [
+    ["リクエスト","件 / 分",[["spark1",S(B,b=>b.n?req(b)/(b.w/60):null)]],1],
+    ["同時に走っている数","平均",[["spark1",S(B,b=>b.n?b.inflight/b.n:null)]],1],
+    ["デコード速度（1 リクエストあたり）","tok/s",[["spark1",S(B,b=>c("decode_seconds_total")(b)>1?c("completion_tokens_total")(b)/c("decode_seconds_total")(b):null)]],1],
+    ["生成トークン","tok / 分（サーバー全体）",[["spark1",S(B,b=>b.n?c("completion_tokens_total")(b)/(b.w/60):null)]],1],
+    ["draft の受理率","",[["spark1",S(B,b=>c("drafted_total")(b)>50?c("accepted_total")(b)/c("drafted_total")(b):null)]],1],
+    ["1 ラウンドで進むトークン","tok / round",[["spark1",S(B,b=>c("rounds_total")(b)>50?c("completion_tokens_total")(b)/c("rounds_total")(b):null)]],1],
+    ["新規プロンプト（キャッシュ後）","tok / リクエスト",[["spark1",S(B,b=>req(b)?(c("prompt_tokens_total")(b)-c("cached_tokens_total")(b))/req(b):null)]],1],
+    ["プロンプトキャッシュの利用率","",[["spark1",S(B,b=>c("prompt_tokens_total")(b)>0?c("cached_tokens_total")(b)/c("prompt_tokens_total")(b):null)]],1],
+    ["prefill の時間","秒 / リクエスト",[["spark1",S(B,b=>req(b)?c("prefill_seconds_total")(b)/req(b):null)]],1],
+    ["KV プールの空き","トークン",[["spark1",S(B,b=>b.poolfree)]],1],
+    ["保持しているプロンプトの状態","件",[["spark1",S(B,b=>b.kept)]],1],
+    ["GPU クロック","MHz",[["spark1",S(B,b=>avg(b.g1&&b.g1.clk))],["spark2",S(B,b=>avg(b.g2&&b.g2.clk))]],2],
+    ["GPU 電力","W",[["spark1",S(B,b=>avg(b.g1&&b.g1.w))],["spark2",S(B,b=>avg(b.g2&&b.g2.w))]],2],
+    ["GPU 温度","°C",[["spark1",S(B,b=>avg(b.g1&&b.g1.t))],["spark2",S(B,b=>avg(b.g2&&b.g2.t))]],2],
+    ["ホストメモリの空き","GiB",[["spark1",S(B,b=>avg(b.g1&&b.g1.free)/1024)],["spark2",S(B,b=>avg(b.g2&&b.g2.free)/1024)]],2],
+  ];
+}
+const fmt=(v,u)=>u===""?(v*100).toFixed(1)+"%":v>=1e5?(v/1e3).toFixed(0)+"k":v>=100?v.toFixed(0):v.toFixed(v>=10?1:2);
+const tf=t=>new Date(t*1e3).toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"});
+function chart(B,[title,unit,ss,ns]){
+  const W=600,Hh=150,L=44,R=8,T=8,Bt=22,all=ss.flatMap(s=>s[1]).filter(v=>v!=null);
+  const card=document.createElement("div");card.className="card";
+  const legend=ns>1?`<div class="leg">${ss.map((s,i)=>`<span><i style="background:var(--s${i+1})"></i>${s[0]}</span>`).join("")}</div>`:"";
+  if(!all.length){card.innerHTML=`<h2>${title}</h2><p class="u">${unit||"&nbsp;"}</p>${legend}<p class="u">データなし</p>`;return card}
+  let lo=Math.min(0,...all),hi=Math.max(...all);if(unit==="")lo=0,hi=1;if(hi===lo)hi=lo+1;
+  const x=i=>L+(W-L-R)*(i+.5)/B.length,y=v=>T+(Hh-T-Bt)*(1-(v-lo)/(hi-lo));
+  const ticks=[lo,(lo+hi)/2,hi];
+  let svg=`<svg viewBox="0 0 ${W} ${Hh}">`;
+  for(const v of ticks)svg+=`<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)"/><text x="${L-4}" y="${y(v)+4}" text-anchor="end" font-size="10" fill="var(--muted)">${fmt(v,unit)}</text>`;
+  for(const i of [0,Math.floor(B.length/2),B.length-1])svg+=`<text x="${x(i)}" y="${Hh-6}" text-anchor="middle" font-size="10" fill="var(--muted)">${tf(B[i].t)}</text>`;
+  ss.forEach((s,k)=>{let d="",pen=false;s[1].forEach((v,i)=>{if(v==null){pen=false;return}d+=(pen?"L":"M")+x(i).toFixed(1)+" "+y(v).toFixed(1);pen=true});svg+=`<path d="${d}" fill="none" stroke="var(--s${k+1})" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>`});
+  svg+=`<line id="x" x1="0" x2="0" y1="${T}" y2="${Hh-Bt}" stroke="var(--muted)" stroke-dasharray="3 3" style="display:none"/></svg>`;
+  card.innerHTML=`<h2>${title}</h2><p class="u">${unit||"&nbsp;"}</p>${legend}${svg}`;
+  const el=card.querySelector("svg"),cx=el.querySelector("#x"),tip=document.getElementById("tip");
+  el.onmousemove=e=>{const r=el.getBoundingClientRect(),i=Math.max(0,Math.min(B.length-1,Math.floor((e.clientX-r.left-L*r.width/W)/((r.width-(L+R)*r.width/W))*B.length)));
+    cx.setAttribute("x1",x(i));cx.setAttribute("x2",x(i));cx.style.display="";
+    tip.innerHTML=tf(B[i].t)+ss.map((s,k)=>`<br><i style="display:inline-block;width:8px;height:8px;background:var(--s${k+1});margin-right:4px"></i>${s[0]}: ${s[1][i]==null?"-":fmt(s[1][i],unit)}`).join("")+(B[i].restart?"<br>再起動":"");
+    tip.style.display="block";tip.style.left=(e.clientX+12)+"px";tip.style.top=(e.clientY+12)+"px"};
+  el.onmouseleave=()=>{cx.style.display="none";tip.style.display="none"};
+  return card;
+}
+async function render(hours){
+  const st=document.getElementById("st");st.textContent="読み込み中";
+  const {H,G1,G2,t0,t1}=await load(hours);const B=buckets(t0,t1);if(H.length)fillHealth(B,H);fillGpu(B,G1,"g1");fillGpu(B,G2,"g2");
+  const g=document.getElementById("g");g.innerHTML="";for(const s of series(B))g.appendChild(chart(B,s));
+  const last=H[H.length-1];document.getElementById("sub").textContent=last?`最終サンプル ${tf(last.ts)}（${last.h.requests_running} 件実行中、累計 ${last.h.requests_total} 件、プール ${last.h.pool_tokens.toLocaleString()} トークン）。spark2 の値は毎時 5 分に同期`:"health の記録がありません";
+  st.textContent=`${B[0].w/60} 分ごと、${H.length} サンプル`;
+}
+let hours=24;document.querySelectorAll("button[data-h]").forEach(b=>b.onclick=()=>{document.querySelectorAll("button[data-h]").forEach(x=>x.setAttribute("aria-pressed",x===b));hours=+b.dataset.h;render(hours)});
+render(hours);setInterval(()=>render(hours),300e3);
+</script></body></html>

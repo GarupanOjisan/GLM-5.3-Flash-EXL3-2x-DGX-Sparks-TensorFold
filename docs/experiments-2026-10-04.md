@@ -559,3 +559,33 @@ against 0.7. In the engine nothing measurable moved (one boot each, replies iden
 | free GB under load (spark1 / worker) | 12 / 17 | 12 / 17 |
 
 Adopted: TF_GLM_CARVEOUT=1 and IMAGE=tensorfold-glm53:k3c in spark1 scripts/local.sh; start.sh adds --cap-add SYS_ADMIN for it.
+
+## Keeping the reply's state for the next turn (2026-10-06/07, image k3k)
+
+Precondition, from the k3l reply log on real traffic: 52 of 52 continued turns sent the previous reply back token for token
+(thinking included), and the reply was 69% of the new tokens of those turns. The engine kept only prompt states on a 64-token
+grid, so every turn prefilled its previous reply again.
+
+k3k keeps the prompt + reply state (committed rows) at the end of each finished request, beside the prompt's own end state,
+and lets a kept reply state resume off the grid (the chunked KDA path takes any start). `TF_GLM_KEEP_REPLY=0` turns it off.
+Turns after the first can change replies slightly: the kept state is the decode kernels' and a re-prefill is the chunk kernels'.
+
+| check (k3k) | result |
+| --- | --- |
+| 4 hashes, drafted == serial, 8 in flight == alone | unchanged, 6/6, 11/11 and 11/11 |
+| short bench / mix (6) | 63.6 tok/s / 88.3 s (k3c: 63.7 / 88.7) |
+| 5-turn thinking conversation, new tokens turns 2-4 | 2,528 / 807 / 1,547 -> 19 / 19 / 13; prefill 1.6 / 0.8 / 1.1 s -> 0.13 / 0.13 / 0.10 s |
+
+30 min of real coding traffic (PARALLEL=8, mostly 1-2 in flight, 100 requests): 103 of 104 continued turns resumed at the
+reply's end (one fell back to 9,024 tokens, cause not found); kept replies 644 tokens mean, 282 median; new tokens 3,206 a
+request; prefill 221 s in all. The replies not prefilled again are ~66k tokens, ~29 s: ~12% of that half hour's prefill, ~1.6%
+of wall time. The gain follows how long the replies are against how much new text a turn brings.
+
+Adopted with `TF_GLM_CACHE_ENTRIES=64` (pool 2,576,384 -> 2,123,776 tokens, given back by the carveout to 2,441,216).
+
+## Continuous metrics (from 2026-10-06)
+
+cron on spark1 appends /health every minute to `~/glm53-metrics/health-DATE.jsonl`; `gpu.sh` appends clock, power,
+temperature, throttle reasons and host memory on both Sparks (`gpu-DATE.csv`; spark2's copied hourly into `spark2/`).
+The dashboard is http://192.168.4.165:8090/ (`tools/tuning/dashboard.html`); `tools/tuning/health_report.py` gives the
+same figures per hour or day from files pulled with `rsync -a spark1:glm53-metrics/ ~/.local-backups/glm-tensorfold/metrics/`.
