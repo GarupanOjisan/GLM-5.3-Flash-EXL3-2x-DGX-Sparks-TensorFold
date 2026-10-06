@@ -283,6 +283,8 @@ _skip='^$'; (( TP == 2 )) || _skip='^TF_ROCE_HCA='
 while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" || true)
 RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK
           --ulimit memlock=-1 --ulimit stack=67108864)
+# experiment: TF_GLM_CARVEOUT=1 lends the GB10 display carveout to the KV pool (the image exports it with CAP_SYS_ADMIN, then drops it)
+[[ "${TF_GLM_CARVEOUT:-0}" == 1 ]] && RUN_ARGS+=(--cap-add SYS_ADMIN)
 
 # ---------------------------------------------------------------- 3. launch, 4. load (a second try when the window does not fit)
 # No token goes into the containers: the ranks read only the local cache (HF_HUB_OFFLINE=1), and with HF_HUB_OFFLINE=0

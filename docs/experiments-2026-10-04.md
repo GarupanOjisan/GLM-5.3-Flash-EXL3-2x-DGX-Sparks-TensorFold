@@ -521,3 +521,41 @@ Adopted 2026-10-06: TF_GLM_PREFILL_ROWS=4096 and TF_GLM_FILL_ROWS=4096 in spark1
 
 The reply's rate while a prompt fills is set by TF_GLM_FILL_BUDGET_MS (200 ms slices), not by the chunk; the longest stall grew ~50 ms.
 Replies identical (8 hashes).
+
+### Real traffic, 30 min, k3p + PARALLEL=8 + 4,096-row chunks (2026-10-06, 10:5x)
+
+| | 2026-10-05 evening (PARALLEL=4, 2048 / 1024 rows) | 2026-10-06 (PARALLEL=8, 4096 rows) |
+| --- | ---: | ---: |
+| requests | 190 (up to 6 wanted: 4 decoding + 2 queued) | 392 (7-8 running in 79% of samples, 9 at the peak) |
+| completion tokens | 81,597 (45 tok/s wall) | 128,238 (71 tok/s wall) |
+| tok/s a request | 20.0 | 12.6 |
+| acceptance, tokens a round | 62.2%, 2.54 | 59.0%, 2.51 |
+| new prompt tokens, prefill s | 644,409 in 615 s (1,048 tok/s) | 647,142 in 712 s (909 tok/s) |
+| cache | 95.3% | 97.3% (kept prompts at the cap of 32) |
+| mean prompt a request | ~71k | ~61k |
+
+Not a controlled comparison: the load differed (7-8 agents against 6) and both settings changed. The server moved 57% more
+completion tokens and the same new prompt tokens in the same 30 minutes; a request decoding beside 7 others gets 12.6 tok/s
+where it would have queued at PARALLEL=4. prefill_seconds is per-request wall time including the decode rounds between slices.
+
+## The GB10 display carveout as KV pool memory (2026-10-06, image k3c, TF_GLM_CARVEOUT=1)
+
+After Enntity/sparkglm's DISPLAY_CARVEOUT=1 (the exporter is a port of its `display_carveout/rm.rs`, AGPL-3.0-only): the firmware's
+2,046 MiB DISPLAY_FRM reservation, which nothing on GB10 uses, is exported through RM ioctls (needs CAP_SYS_ADMIN, dropped before
+`tensorfold serve`), imported with cuMemImportFromShareableHandle / cuMemMap, and holds the first two latent KV planes (the second
+runs on into cuMemCreate'd device memory in the same address range). The pool grows by the 2,046 MiB. `tools/tuning/carveout/`.
+
+The mapping is L2-uncached: plain copies read it at ~59 GB/s against 120 for cudaMalloc memory, and a 131k-row gather took 1.3 ms
+against 0.7. In the engine nothing measurable moved (one boot each, replies identical, drafted == serial 6/6):
+
+| | carveout off | carveout on |
+| --- | ---: | ---: |
+| pool tokens (PARALLEL=8, CACHE_ENTRIES=64) | 2,123,776 | 2,441,216 (+15%) |
+| short bench all | 63.6 | 63.7 |
+| long bench, 4 in flight | 95.4 | 94.4 |
+| cold 31k prompt | 1,846 tok/s | 1,841 |
+| 2.8k piece, 1 / 3 others decoding (wall) | 2.32 / 2.45 s | 2.34 / 2.45 |
+| mix (6 conversations) | 88.3 s | 88.7 s |
+| free GB under load (spark1 / worker) | 12 / 17 | 12 / 17 |
+
+Adopted: TF_GLM_CARVEOUT=1 and IMAGE=tensorfold-glm53:k3c in spark1 scripts/local.sh; start.sh adds --cap-add SYS_ADMIN for it.
