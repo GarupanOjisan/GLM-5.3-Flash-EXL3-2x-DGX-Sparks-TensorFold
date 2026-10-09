@@ -46,6 +46,13 @@ TensorFold
   patches/0059-server-refused-bodies.patch is upstream TensorFold commit 50dfe38a (v0.6.1, #181, by Dorian /
   SxMShaDoW) backported to v0.6.0 (merged with 0037's /tokenize routes; its test's oversized body enlarged past
   0050's 96 MiB limit).
+  native/patches/0001-glm-cuda-two-ranks.patch modifies TensorFold v1.0.2 (commit f8fe17d) and adds GLM's two-rank
+  CUDA family to its native (Zig) engine; scripts/native-image.sh applies it when it builds the native image. Its new
+  files and changes are this project's work under Apache-2.0, except: CUDA kernels it copies from TensorFold
+  v0.6.6's source and from this project's patches/ (each file names its source; the parts credited below keep their
+  credit), and the TensorFold code it modifies or quotes, which stays under TensorFold's licenses as above.
+  native/aot/sm121 holds Triton kernels compiled from TensorFold v0.6.0 with this project's patches/ (Apache-2.0,
+  and MIT for TensorFold code written before 0.6.0, as above).
 
 b12x
   https://github.com/local-inference-lab/b12x
@@ -56,6 +63,8 @@ b12x
   HCAs that share its subnet), proxy ABI 5; with no routes set it behaves as b12x's file. Its header lists these
   changes. tensorfold/cuda/roce.cu reimplements b12x's CuTe DSL all-gather kernel (b12x/comm/roce/_allgather_cute.py
   at the same commit) in CUDA C++, with the same stages and memory orderings.
+  native/patches/0001-glm-cuda-two-ranks.patch carries the same two files for the native engine
+  (zig/src/families/glm/cuda/roce_proxy.c, and zig/kernels/cuda/glm_roce.cu from roce.cu).
 
 glm53-tensorfold-spark
   https://github.com/jayleaton/glm53-tensorfold-spark
@@ -93,6 +102,8 @@ glm53-tensorfold-spark
       the first steps' words issued before the member rows reach shared memory. Changed here: built into this
       project's decode kernel (its expert plan, fused down / gate-up epilogues and per-row input rotation kept), ring
       depth 1, 2 or 4 as a template parameter, no probe or PDL variants.
+    - native/patches/0001-glm-cuda-two-ranks.patch copies these two kernels for the native engine
+      (zig/kernels/cuda/glm_l2pf.cu, and glm_exl3d.cu from exl3.cu).
   patches/0058-server-client-gone-poll.patch is Jay Leaton's TensorFold pull request #218
   (https://github.com/ashhart/TensorFold/pull/218, Apache-2.0), applied to v0.6.0 unchanged:
   tensorfold/server/cancellation.py's client-gone check asks poll() instead of select().
