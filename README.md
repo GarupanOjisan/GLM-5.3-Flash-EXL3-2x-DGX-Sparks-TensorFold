@@ -477,6 +477,80 @@ devices toward all its peers, and each device's RoCE v2 GID is found on its own)
   the same three Sparks.
 - `prepare.sh` on its own takes `TP` too: `TP=3 scripts/prepare.sh`.
 
+## Native engine (TensorFold 1.0.2, experimental)
+
+TensorFold 1.0 replaced the Python engine with a Zig binary, and 1.0.2 serves GLM-5.3-Flash only on two M5 Ultra Macs
+(Metal, MLX 4-bit). `native/patches/0001-glm-cuda-two-ranks.patch` adds GLM-5.3-Flash on two CUDA ranks to
+TensorFold 1.0.2 (commit `f8fe17d`): the EXL3 checkpoint's weights, v1.8's GLM kernels as CUDA C (EXL3 experts,
+KDA chunked prefill, hc, L2 prefetch, 4-bit dense matmuls) and its Triton kernels compiled ahead of time
+(`native/aot/sm121`), the dense projections quantized to 4 bits at load and an FP8 head as v1.8's `TF_GLM_DENSE=q4`,
+an FP8 attention cache (`TF_GLM_KV=fp8`), NCCL between the Sparks, MTP drafts and sampling, served by
+`tensorfold-native serve` with rank 1 following over a TCP control channel.
+
+```bash
+./start-native.sh        # builds the image once (scripts/native-image.sh), then starts both ranks
+./stop.sh                # stops it, as for ./start.sh; ./start.sh brings the Python engine back
+```
+
+`start-native.sh` reads the same settings (`scripts/config.sh`, `scripts/local.sh`): `MODEL_ID`, `PORT`, `CONTEXT`,
+`MAX_TOKENS`, `THINKING`, `MEMORY_RESERVE_GIB`, `WORKER`, the RoCE links, `DRAFTER` (`dflash2`, the default, or
+`mtp`), `COPY`, `COPY_MAX`, `DRAFT_POLICY`, `KV`, `DENSE` and `KDA_CHUNKED`. It ignores `PARALLEL` and `VISION`.
+
+**Drafts.** As v1.8: copy drafts from the prompt first (up to 15, windows up to 16 rows), else DFlash2's chain (up to
+7; the MTP head is not loaded, as v1.8's `TF_GLM_MTP=auto`), or with `DRAFTER=mtp` the checkpoint's MTP head. One
+request at a time, greedy, against v1.8 with `DRAFTER=dflash2 COPY=1 PARALLEL=1` on the same 13 prompts: the same
+replies and rounds, at 93-103% of v1.8's speed (code edit 102 tokens/s, v1.8 106; a quoted passage 136, v1.8 142;
+prose 44, v1.8 47). At 1,048,576 tokens about 20.6 GiB stays free with DFlash2 loaded.
+
+**Exactness.** Against v1.8 itself with its production GLM settings (`TF_GLM_DENSE=q4 TF_GLM_KV=fp8
+TF_GLM_KDA_CHUNKED=1 TF_GLM_EXL3_LOADS=nc TF_GLM_L2PF=1`, one stream, MTP drafts), greedy and token by token, with
+MTP drafts 3 and 7 deep: 6 prompts (chats, 2,918 and 4,422 tokens), 42 prompt lengths covering every prompt-chunk
+remainder, 8,192 and 32,768 tokens, and a 123,312-token prompt. Each v1.8 kernel came in as its own step, checked
+against v1.8 with only the steps so far switched on; each has a switch back (`TF_GLM_DENSE=b16`, `TF_GLM_EXL3_DEC=0`,
+`TF_GLM_KDA_CHUNKED=0`, `TF_GLM_KV=bf16`, `TF_GLM_HC_DEC=0`, `TF_GLM_L2PF=0`; the reply then differs from v1.8's).
+
+**Speed against v1.8**, one request, both engines on the same two Sparks in one session, page cache dropped before
+each run, MTP drafts 3 deep (the native engine at 524,288 and 1,048,576 tokens, the same within a few %):
+
+| | v1.8 (Python) | native |
+|---|---|---|
+| 8,192-token prefill | 8.1 s (first prompt) | 5.3-5.9 s |
+| 32,768-token prefill | 20.9 s | 20.3 s |
+| 123,312-token prefill | 83.8 s | 81.4 s |
+| Decode, serial | 32.7-34.0 tokens/s | 33.3-34.2 tokens/s |
+| Decode, MTP drafts | 56-71 tokens/s | 60-69 tokens/s |
+| Decode window, 1 / 4 / 8 rows | 28.5 / 45.9 / 62.6 ms | 28.7 / 49.4 / 66.7 ms |
+| Start to weights loaded | 234-241 s | 63-67 s |
+
+At 1,048,576 tokens about 20 GiB stays free on each Spark.
+
+**Page cache.** When files read earlier still fill the page cache (an image build, a checkpoint read through the
+cache) and the ranks have to allocate around it, every prompt prefills about 25-40% slower until they restart (8,192
+tokens: 21.6 s, then 16.5 s after `sysctl vm.drop_caches=3`; served, 361 tokens/s before, 510 after). So
+`start-native.sh` drops the page cache on both Sparks before it starts the ranks; that needs passwordless `sudo`,
+and without it the script warns and starts anyway. Host swapping, the GPU clock, proactive compaction and physical
+memory fragmentation alone were ruled out.
+
+**What it does not have yet**, against v1.8 (measured on two Sparks, `Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit`):
+
+| | Python engine (`./start.sh`) | native (`./start-native.sh`) |
+|---|---|---|
+| Requests at once | 4 (up to 8) | 1 |
+| Prompt states kept between turns | yes, per conversation | yes, for the conversation last served (see below) |
+| Vision, structured outputs | yes | no |
+
+Requests without `temperature` sample at the server default (temperature 1.0, top_p 0.95, no top_k). Without
+`top_k` (or with one above 1,016) both ranks' logits rows are gathered and the token is drawn over the whole
+vocabulary with v0.6.6's rule (`nucleus_rows`; the same tokens on 24 test rows).
+
+**Kept prompt states.** A later request that starts with an earlier one's tokens (the same system prompt and tools,
+or the next turn of a chat) resumes at the last state kept at a shared chunk start instead of prefilling from 0: with
+a 35,519-token system prompt, the first request took 65 s and later ones 0.4 s, with the same replies as a server
+without the cache. A kept state is only KDA's recurrent state and conv windows (about 74 MB a rank); the attention
+caches are positional and not copied, so a state resumes only while the rows below it still hold its tokens. A request
+of another conversation overwrites them: going back then prefills again (once), so two long conversations taking turns
+both prefill every time. The states take up to `--prompt-cache-gib` (default 2 GiB, about 27 states).
+
 ## Configuration
 
 Every setting lives in [`scripts/config.sh`](scripts/config.sh). Set one for a single run from the environment
@@ -722,11 +796,13 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 ```
 start.sh      set up (first run) and start both ranks
 start-tp3.sh  the same on three Sparks (experimental, patches 0066-0068)
+start-native.sh  TensorFold 1.0.2's native engine on two Sparks (experimental, native/)
 stop.sh       stop them
 scripts/      config.sh (all settings), local.sh.example (this setup's WORKER, ABLIT), prepare.sh (image + checkpoint on
               both Sparks), nodes.sh (ssh and the RoCE links), publish-image.sh (push the image to GHCR),
               banner.sh (start.sh's banner)
 patches/      patches baked into the image
+native/       the native engine: patches/ (TensorFold 1.0.2 + GLM on CUDA), aot/sm121 (its Triton kernels)
 tools/        checks against the running server (needle, tool calls, end of turn, prompt reuse, kept prompts under a
               full pool) and patches 0072's, 0073's and 0074's checks
 CHANGELOG.md  what changed in each release

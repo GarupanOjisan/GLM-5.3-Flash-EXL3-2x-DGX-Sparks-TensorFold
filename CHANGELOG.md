@@ -3,6 +3,21 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
+## Unreleased: TensorFold 1.0.2's native engine on two Sparks (experimental)
+
+### Added
+- **`./start-native.sh`** serves GLM-5.3-Flash with TensorFold 1.0.2's Zig engine on two Sparks, beside v1.8's
+  `./start.sh` (README "Native engine"). `native/patches/0001-glm-cuda-two-ranks.patch` ports GLM's CUDA engine to
+  1.0.2 (EXL3 weights, NCCL between the ranks, MTP drafts, sampling) with v1.8's speed kernels: 4-bit dense
+  projections and an FP8 head (`TF_GLM_DENSE=q4`), v1.8's EXL3 expert, KDA chunked, hc and L2-prefetch kernels, and
+  an FP8 attention cache. `native/aot/sm121` holds its Triton kernels; `scripts/native-image.sh` builds the image.
+  Token-exact against v1.8 with its production GLM settings (one stream, MTP drafts 3 and 7 deep, prompts up to
+  123,312 tokens), and as fast: 32,768 tokens prefill in 20.3 s (v1.8 20.9 s), 33-34 tokens/s serial, 60-69 with
+  MTP (v1.8 56-71), and it loads in about 65 s (v1.8 about 240 s). Prompt states are kept for the conversation last
+  served (a 35k-token system prompt's later requests: 24 s -> 0.4 s). Drafts as v1.8: copy drafts (`COPY`, windows
+  up to 16 rows) and DFlash2 (`DRAFTER=dflash2`, the default) or the MTP head; with DFlash2 and copies, the same
+  replies as v1.8 at 93-103% of its speed, one request at a time. No vision or structured outputs yet.
+
 ## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
 
 Image: `v0.6.0-a1897d591f70` (`sha256:bc34d7d63f978cf601f42863b284bc95a567c50c10e9adb0866a635be568bf5f`), 96 patches (v1.9.1's plus `0096`, `0097`). Tested live on two
