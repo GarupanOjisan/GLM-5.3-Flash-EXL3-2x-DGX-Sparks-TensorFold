@@ -60,8 +60,9 @@ worker 1 "$drop" 2>/dev/null || warn "could not drop the page cache on $WORKER (
 
 RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK
           --ulimit memlock=-1 --security-opt seccomp=unconfined)
+# An idle server waits up to ACCEPT_WAIT_MS for requests arriving together, so they prefill in one pass (0: at once).
 ENV_ARGS=(-e TF_GLM_PORT="$RANK_PORT" -e TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB" -e TENSORFOLD_NO_UPDATE_CHECK=1
-          "${DRAFTER_ENV[@]}")
+          -e TENSORFOLD_ACCEPT_WAIT_MS="${ACCEPT_WAIT_MS:-20}" "${DRAFTER_ENV[@]}")
 for v in TF_GLM_KV TF_GLM_DENSE TF_GLM_KDA_CHUNKED TF_GLM_L2PF TF_GLM_COPY_DRAFTS TF_GLM_COPY_MAX \
          TF_GLM_COPY_REPLY_MATCH TF_GLM_WIDE_GRAPHS TF_GLM_DFLASH_POLICY; do   # config.sh's settings the engine reads
   [[ -n "${!v:-}" ]] && ENV_ARGS+=(-e "$v=${!v}")

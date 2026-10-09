@@ -499,6 +499,9 @@ drafts, and several requests decoding together in one verify window (v1.10's seg
 `mtp`), `COPY`, `COPY_MAX`, `DRAFT_POLICY`, `KV`, `DENSE`, `KDA_CHUNKED` and `PARALLEL`. It ignores `VISION`.
 With `PARALLEL` above 1 and no `CONTEXT` set, the window is 262,144 tokens: each request gets a whole window of its
 own (no shared pool yet), and four at 1,048,576 need 51.3 GiB a Spark where 16.7 GiB is left after the weights.
+`ACCEPT_WAIT_MS` (default 20): an idle server waits this long for more requests before it starts on the first, so
+requests sent together prefill in one pass and start decoding together, as v1.10 does; a lone request's first token
+comes that much later. `0` starts at once.
 
 **Drafts.** As v1.8: copy drafts from the prompt first (up to 15, windows up to 16 rows), else DFlash2's chain (up to
 7; the MTP head is not loaded, as v1.8's `TF_GLM_MTP=auto`), or with `DRAFTER=mtp` the checkpoint's MTP head. One
