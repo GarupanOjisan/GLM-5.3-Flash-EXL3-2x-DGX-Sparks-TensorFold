@@ -557,7 +557,7 @@ every cell). A native round of four is about 110 ms: the shared window's forward
 | | Python engine (`./start.sh`) | native (`./start-native.sh`) |
 |---|---|---|
 | Requests at once | 4 (up to 8), one shared pool | 4 (`PARALLEL`), a whole window each (262,144 tokens at 4) |
-| Prompt states kept between turns | yes, per conversation | yes, for the conversation last served (see below) |
+| Prompt states kept between turns | yes, per conversation, in the shared pool | yes, per conversation in each request's own window (`PARALLEL` above 1); the conversation last served at `PARALLEL=1` |
 | Vision, structured outputs | yes | no |
 
 Requests without `temperature` sample at the server default (temperature 1.0, top_p 0.95, no top_k). Without
@@ -569,8 +569,10 @@ or the next turn of a chat) resumes at the last state kept at a shared chunk sta
 a 35,519-token system prompt, the first request took 65 s and later ones 0.4 s, with the same replies as a server
 without the cache. A kept state is only KDA's recurrent state and conv windows (about 74 MB a rank); the attention
 caches are positional and not copied, so a state resumes only while the rows below it still hold its tokens. A request
-of another conversation overwrites them: going back then prefills again (once), so two long conversations taking turns
-both prefill every time. The states take up to `--prompt-cache-gib` (default 2 GiB, about 27 states).
+of another conversation overwrites them: at `PARALLEL=1` going back then prefills again (once), so two long
+conversations taking turns both prefill every time. With `PARALLEL` above 1 each conversation keeps its own lane's
+rows: two conversations with 10.8k- and 11.5k-token system prompts taking turns prefilled once each (6.3 and 6.7 s),
+then resumed at 10,752 and 11,392 cached tokens every turn (0.4-0.6 s). The states take up to `--prompt-cache-gib` (default 2 GiB, about 27 states).
 
 ## Configuration
 
