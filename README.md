@@ -569,9 +569,9 @@ accepts a little more a round.
 | Prompt states kept between turns | yes, per conversation, in the shared pool | yes, per conversation in each request's own window (`PARALLEL` above 1); the conversation last served at `PARALLEL=1` |
 | Vision, structured outputs | yes | no |
 
-Requests without `temperature` sample at the server default (temperature 1.0, top_p 0.95, no top_k). Without
-`top_k` (or with one above 1,016) both ranks' logits rows are gathered and the token is drawn over the whole
-vocabulary with v0.6.6's rule (`nucleus_rows`; the same tokens on 24 test rows).
+Requests without `temperature` sample at the server default, which `start-native.sh` sets as v1.10's (temperature
+1.0, top_p 0.95, top_k 20). With `top_k: 0` (or one above 1,016) the token is drawn over the whole vocabulary with
+v1.10's nucleus union rule, both ranks' logits rows gathered only when the union needs them.
 
 **Kept prompt states.** A later request that starts with an earlier one's tokens (the same system prompt and tools,
 or the next turn of a chat) resumes at the last state kept at a shared chunk start instead of prefilling from 0: with
