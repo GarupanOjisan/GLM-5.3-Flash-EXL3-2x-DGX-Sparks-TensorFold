@@ -5917,10 +5917,10 @@ index 0000000..9621dbe
 +};
 diff --git a/zig/src/families/glm/cuda/glm_forward.zig b/zig/src/families/glm/cuda/glm_forward.zig
 new file mode 100644
-index 0000000..44800f6
+index 0000000..d07e521
 --- /dev/null
 +++ b/zig/src/families/glm/cuda/glm_forward.zig
-@@ -0,0 +1,2124 @@
+@@ -0,0 +1,2185 @@
 +//! GLM-5.3-Flash's tensor-parallel forward, MTP step and commit on CUDA, launch for launch as the Python engine runs
 +//! them (v0.6.6 families/glm5_next/cuda/forward.py and mtp.py, TF_GLM_LATENT=1, the EXL3 checkpoint), eagerly:
 +//! every buffer is static, positions live on the device, and the host knows them too (Python's host_pos path).
@@ -6415,7 +6415,7 @@ index 0000000..44800f6
 +    pk: [16]u64 = @splat(0),
 +    lat_row: usize,
 +    pk_row: usize,
-+    /// The segmented window's KDA projection rows and replay saves, [layers, max_rows, ...] as a State's (kda.KDAScratchSet).
++    /// The segmented window's KDA projection rows and replay saves, [layers, shared_rows, ...] (kda.KDAScratchSet's layout).
 +    proj: u64,
 +    scr: KdaScratch,
 +    /// kda.segment_table [max_lanes, kern.seg_cols] i32 and segments.SegRows' tables (glm_segments.zig), device copies.
@@ -6442,7 +6442,7 @@ index 0000000..44800f6
 +            .mla => n_dsa += 1,
 +        };
 +        const ext = extentRows(capacity);
-+        const mr = Engine.max_rows;
++        const mr = Engine.shared_rows;
 +        var p: Pool = undefined;
 +        p.mem = undefined;
 +        p.slots = slots;
@@ -6571,6 +6571,9 @@ index 0000000..44800f6
 +    split: ?Split = null,
 +
 +    pub const max_rows = 16; // engine.MAX_ROWS: a pending token and up to 15 copied drafts
++    /// A shared round's rows across lanes (v1.10's TF_GLM_MULTI_WINDOW, 32): the window buffers and the pool's KDA
++    /// scratch hold that many; each lane's own part stays within max_rows.
++    pub const shared_rows = segments.max_rows;
 +    pub const mtp_rows = 8; // engine.MTP_ROWS: rows an MTP step takes at once (a kept backlog is absorbed in steps of this)
 +    /// Windows of 1..8 and `wide_graph` rows x 2 KDA parities and MTP steps of 1..8 rows, each dense or at one of ~10 pool
 +    /// buckets (9 widths x 2 x 11 + 8 x 11 = 286).
@@ -6599,17 +6602,17 @@ index 0000000..44800f6
 +        // count, then allocate once and carve
 +        var count: Arena = .{ .base = 0, .size = 0 };
 +        const tap_n: usize = if (taps != null) 5 else 0;
-+        _ = carve(&count, w, max_rows, capacity, false, np_max, tap_n);
++        _ = carve(&count, w, shared_rows, capacity, false, np_max, tap_n);
 +        _ = carve(&count, w, prefill_rows, capacity, true, np_max, tap_n);
 +        _ = carve(&count, w, mtp_rows, capacity, false, np_max, 0);
 +        const kv_fp8 = try kvFp8();
-+        const shared_bytes = max_rows * width * bf + max_rows * ll * 128 * bf + 512;
++        const shared_bytes = shared_rows * width * bf + shared_rows * ll * 128 * bf + 512;
 +        const total = count.used + shared_bytes + 4096;
 +        e.mem = try cuda.DeviceBuffer.alloc(d, total);
 +        errdefer e.mem.free();
 +        try e.mem.fill8(0, null);
 +        var a: Arena = .{ .base = e.mem.ptr, .size = total };
-+        e.buf = carve(&a, w, max_rows, capacity, false, np_max, tap_n);
++        e.buf = carve(&a, w, shared_rows, capacity, false, np_max, tap_n);
 +        e.pbuf = carve(&a, w, prefill_rows, capacity, true, np_max, tap_n);
 +        e.mbuf = carve(&a, w, mtp_rows, capacity, false, np_max, 0);
 +        e.tap_layers = taps orelse @splat(std.math.maxInt(u32));
@@ -6623,8 +6626,8 @@ index 0000000..44800f6
 +        e.pool = null;
 +        e.seg_sel = null;
 +        e.seg_enabled = envOn("TF_GLM_SEG");
-+        e.sproj = a.take(max_rows * width * bf);
-+        e.sout = a.take(max_rows * ll * 128 * bf);
++        e.sproj = a.take(shared_rows * width * bf);
++        e.sout = a.take(shared_rows * ll * 128 * bf);
 +        e.n_lanes = 1;
 +        e.lane = 0;
 +        e.w = w;
@@ -6878,8 +6881,26 @@ index 0000000..44800f6
 +    fn mm(e: *Engine, b: *const Buffers, x: u64, x_stride: usize, xs: u64, q: Mat, out: u64, rows: usize, wide: bool) !void {
 +        switch (q.kind) {
 +            .b16 => try e.t.matmulB16(x, x_stride, q.ptr, out, b.sk, rows, q.n, q.k, wide),
-+            .q4 => if (b.prefill) try kern.q4Prefill(e.k, e.s, x, x_stride, q.q4(), out, rows, wide) else try kern.qmmDecode(e.k, e.s, x, x_stride, xs, q.q4(), out, rows, wide),
-+            .f8 => try e.t.matmulF8(x, x_stride, q.ptr, q.s, out, b.sk, rows, q.n, q.k, wide),
++            .q4 => if (b.prefill) try kern.q4Prefill(e.k, e.s, x, x_stride, q.q4(), out, rows, wide) else {
++                // qmm_cfg takes 16 rows a launch: a shared window past that in 16-row pieces, each row's arithmetic as alone
++                const qq = q.q4();
++                const ob: usize = if (wide) f4 else bf;
++                var r: usize = 0;
++                while (r < rows) : (r += max_rows) {
++                    const m = @min(max_rows, rows - r);
++                    try kern.qmmDecode(e.k, e.s, x + r * x_stride * bf, x_stride, xs + r * (qq.k / 64) * f4, qq, out + r * qq.n * ob, m, wide);
++                }
++            },
++            .f8 => {
++                // the captured _fmm shapes stop at a lane window (16 rows): a shared window past that in 16-row pieces
++                const step = if (b.prefill) rows else max_rows;
++                const ob: usize = if (wide) f4 else bf;
++                var r: usize = 0;
++                while (r < rows) : (r += step) {
++                    const m = @min(step, rows - r);
++                    try e.t.matmulF8(x + r * x_stride * bf, x_stride, q.ptr, q.s, out + r * q.n * ob, b.sk, m, q.n, q.k, wide);
++                }
++            },
 +        }
 +    }
 +
@@ -7423,7 +7444,7 @@ index 0000000..44800f6
 +            st.row0 = rows;
 +            rows += g.rows;
 +        }
-+        if (rows != tokens.len or rows > e.buf.rows) return error.WindowTooWide;
++        if (rows != tokens.len or rows > max_rows) return error.WindowTooWide; // the lanes' own KDA scratch
 +        try e.upload(e.buf.ids, std.mem.sliceAsBytes(tokens));
 +        const b = &e.buf;
 +        const prefetch = !e.l2pf_active and if (e.l2pf) |p| rows <= p.s.rows else false;
@@ -7620,7 +7641,7 @@ index 0000000..44800f6
 +            ks[i] = .{ .row0 = 0, .rows = @intCast(g.rows), .slot = @intCast(st.slot), .parity = @intCast(st.cur), .conv = @intCast(st.slot), .keep = @intCast(g.rows) };
 +            rows += g.rows;
 +        }
-+        if (rows != tokens.len or rows > max_rows) return error.WindowTooWide;
++        if (rows != tokens.len or rows > shared_rows) return error.WindowTooWide;
 +        const long = e.st.long_context;
 +        _ = try segments.SegRows.fill(spans[0..segs.len], if (long) denseLimit(e.w) else null, &e.seg_host);
 +        try kern.segmentTable(ks[0..segs.len], &e.kseg_host);
@@ -7667,7 +7688,7 @@ index 0000000..44800f6
 +        const pl = &e.pool.?;
 +        const li: usize = e.st.kda_index[l.index];
 +        const ll: usize = c.kda_heads / wt.world;
-+        const p = pl.proj + li * max_rows * e.width * bf;
++        const p = pl.proj + li * shared_rows * e.width * bf;
 +        try e.mm(b, b.normed, c.hidden, b.xs, kw.proj, p, rows, false);
 +        const fa = p + kw.fa_off * bf;
 +        const ga = p + kw.ga_off * bf;
@@ -7678,7 +7699,7 @@ index 0000000..44800f6
 +        try e.pfSite(l.index, 2);
 +        const rec_layer = ll * 128 * 128 * f4;
 +        const conv_layer = 3 * 3 * ll * 128 * bf;
-+        const out = pl.scr.out + li * max_rows * ll * 128 * bf;
++        const out = pl.scr.out + li * shared_rows * ll * 128 * bf;
 +        try kern.chainSegments(e.k, e.s, .{
 +            .heads = ll,
 +            .seg = pl.kseg,
@@ -7703,10 +7724,10 @@ index 0000000..44800f6
 +            .lower = c.lower_bound,
 +            .rows = rows,
 +            .out = out,
-+            .k_save = pl.scr.k + li * max_rows * ll * 128 * f4,
-+            .v_save = pl.scr.v + li * max_rows * ll * 128 * bf,
-+            .g_save = pl.scr.g + li * max_rows * ll * 128 * f4,
-+            .b_save = pl.scr.b + li * max_rows * ll * f4,
++            .k_save = pl.scr.k + li * shared_rows * ll * 128 * f4,
++            .v_save = pl.scr.v + li * shared_rows * ll * 128 * bf,
++            .g_save = pl.scr.g + li * shared_rows * ll * 128 * f4,
++            .b_save = pl.scr.b + li * shared_rows * ll * f4,
 +            .q_tmp = b.q_tmp,
 +            .y_tmp = b.y_tmp,
 +        });
@@ -7766,11 +7787,51 @@ index 0000000..44800f6
 +            e.kseg_host = @splat(.{ .row0 = 0, .rows = 0, .slot = 0, .parity = 0, .conv = 0, .keep = 0 });
 +            e.kseg_host[0] = .{ .row0 = @intCast(st.row0), .rows = @intCast(rows), .slot = @intCast(st.slot), .parity = @intCast(st.cur), .conv = @intCast(st.slot), .keep = @intCast(keep) };
 +            try e.upload(pl.kseg, std.mem.sliceAsBytes(&e.kseg_host));
-+            if (keep < rows) try kern.replayLayersSegments(e.k, e.s, pl.kseg, 1, n, ll, pl.rec, pl.rec_slot / f4, pl.rec_slot / (2 * f4), pl.scr.k, pl.scr.v, pl.scr.g, pl.scr.b, max_rows);
-+            try e.t.convShiftSeg(pl.conv, pl.proj, pl.kseg, 1, n, 3 * ll * 128, pl.conv_slot / bf, 3 * 3 * ll * 128, max_rows * e.width, e.width);
++            if (keep < rows) try kern.replayLayersSegments(e.k, e.s, pl.kseg, 1, n, ll, pl.rec, pl.rec_slot / f4, pl.rec_slot / (2 * f4), pl.scr.k, pl.scr.v, pl.scr.g, pl.scr.b, shared_rows);
++            try e.t.convShiftSeg(pl.conv, pl.proj, pl.kseg, 1, n, 3 * ll * 128, pl.conv_slot / bf, 3 * 3 * ll * 128, shared_rows * e.width, e.width);
 +            st.cur = 1 - st.cur;
 +        }
 +        try e.setPos(st.pos + keep);
++    }
++
++    pub const Keep = struct { lane: usize, rows: usize, keep: usize };
++
++    /// commitSeg for several lanes of the last segmented window at once (verify.BatchedVerify.commit over its segments): one
++    /// table, one replay of the segments that keep fewer rows than they ran, one conv shift; then each lane's parity and
++    /// position. Every lane's last window must be segmented (Node.keepLanes commits the others on their own).
++    pub fn commitSegs(e: *Engine, ks: []const Keep) !void {
++        const m = ks.len;
++        if (m == 0) return;
++        if (m > max_lanes) return error.TooManySegments;
++        var segs: [max_lanes]*State = undefined;
++        for (ks) |it| {
++            if (it.keep < 1 or it.keep > it.rows) return error.BadKeep;
++            if (it.lane >= e.n_lanes or !e.laneState(it.lane).seg) return error.NotSegmented;
++        }
++        for (ks[0..m], 0..) |it, i| segs[i] = e.laneState(it.lane);
++        const n = segs[0].kda_layers;
++        if (n > 0) {
++            const pl = &e.pool.?;
++            const ll: usize = e.w.cfg.kda_heads / wt.world;
++            e.kseg_host = @splat(.{ .row0 = 0, .rows = 0, .slot = 0, .parity = 0, .conv = 0, .keep = 0 });
++            var r: usize = 0; // the replayed segments first: replayLayersSegments takes the first r, convShiftSeg all m
++            for ([_]bool{ true, false }) |replayed| for (ks[0..m], segs[0..m]) |it, st| {
++                if ((it.keep < it.rows) != replayed) continue;
++                e.kseg_host[r] = .{ .row0 = @intCast(st.row0), .rows = @intCast(it.rows), .slot = @intCast(st.slot), .parity = @intCast(st.cur), .conv = @intCast(st.slot), .keep = @intCast(it.keep) };
++                r += 1;
++            };
++            var replays: usize = 0;
++            for (ks[0..m]) |it| replays += @intFromBool(it.keep < it.rows);
++            try e.upload(pl.kseg, std.mem.sliceAsBytes(&e.kseg_host));
++            if (replays > 0) try kern.replayLayersSegments(e.k, e.s, pl.kseg, replays, n, ll, pl.rec, pl.rec_slot / f4, pl.rec_slot / (2 * f4), pl.scr.k, pl.scr.v, pl.scr.g, pl.scr.b, shared_rows);
++            try e.t.convShiftSeg(pl.conv, pl.proj, pl.kseg, m, n, 3 * ll * 128, pl.conv_slot / bf, 3 * 3 * ll * 128, shared_rows * e.width, e.width);
++        }
++        for (ks[0..m], segs[0..m]) |it, st| {
++            st.seg = false;
++            if (n > 0) st.cur = 1 - st.cur;
++            st.pos += it.keep;
++            try e.setInt(st.pos_dev, st.pos);
++        }
 +    }
 +
 +    /// forward.commit: keep the last decode window's first `keep` rows.
@@ -9623,10 +9684,10 @@ index 0000000..3f4c536
 +}
 diff --git a/zig/src/families/glm/cuda/glm_native.zig b/zig/src/families/glm/cuda/glm_native.zig
 new file mode 100644
-index 0000000..10dd3ec
+index 0000000..72f5826
 --- /dev/null
 +++ b/zig/src/families/glm/cuda/glm_native.zig
-@@ -0,0 +1,997 @@
+@@ -0,0 +1,1022 @@
 +//! GLM-5.3-Flash on two CUDA ranks behind the native family interface (native/cuda.zig): this process is rank 0
 +//! and serves; rank 1 runs `tf-glm follow` on the other Spark. A stream a lane (each lane one sequence's caches and
 +//! DFlash2 context), the lanes' rounds taking turns; an idle lane keeps its caches' rows, so a later turn of its
@@ -9764,7 +9825,7 @@ index 0000000..10dd3ec
 +    costs: [max_rows]lanes.config.Cost = undefined,
 +    /// Shared windows' ms by total rows: the lone windows' until `grow` times them over two lanes (the facts point here,
 +    /// and the lane core reads them after `grow`).
-+    shared: [max_rows]lanes.config.Cost = undefined,
++    shared: [fwd.Engine.shared_rows]lanes.config.Cost = undefined,
 +    io: std.Io = undefined,
 +    mtp_ms: f64 = 1.0,
 +    vtable: be.Backend.VTable = undefined,
@@ -10081,14 +10142,14 @@ index 0000000..10dd3ec
 +        if (windows.len > max_lanes) return error.TooManyWindows;
 +        var segs: [max_lanes]fwd.Engine.Seg = undefined;
 +        var ks: [max_lanes]usize = undefined;
-+        var ids: [max_rows]u32 = undefined;
++        var ids: [fwd.Engine.shared_rows]u32 = undefined;
 +        var total: usize = 0;
 +        for (windows, 0..) |w, i| {
 +            if (w.parents != null) return error.TreesNotBuilt;
 +            const ln = try g.enter(w.stream);
 +            try g.commit(ln, ln.pending_rows); // no keep since its last window: all of its rows stay
 +            const rows = w.rows();
-+            if (total + rows > max_rows) return error.WindowTooWide;
++            if (total + rows > g.sharedRows()) return error.WindowTooWide;
 +            if (w.held > ln.held_n) return error.NoHeldDrafts;
 +            for (w.positions, 0..) |pos, r| if (pos != g.n.e.st.pos + 1 + r) return error.PositionMismatch;
 +            ids[total] = w.pending;
@@ -10186,6 +10247,25 @@ index 0000000..10dd3ec
 +        var ls: [max_lanes]usize = undefined;
 +        var pend: [max_lanes]u32 = undefined;
 +        var m: usize = 0;
++        // every lane's kept rows in one commit (Node.keepLanes), before the turns: each turn's own commit then finds nothing
++        var keeps: [max_lanes]fwd.Engine.Keep = undefined;
++        var nk: usize = 0;
++        for (requests) |r| {
++            const rows = r.rows orelse continue;
++            for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
++            for (g.lanes[0..g.n_lanes], 0..) |*ln, li| if (ln.stream == r.stream and ln.pending_rows > 0) {
++                keeps[nk] = .{ .lane = li, .rows = ln.pending_rows, .keep = rows.len };
++                nk += 1;
++            };
++        }
++        if (nk > 0) {
++            try g.n.keepLanes(keeps[0..nk]);
++            for (keeps[0..nk]) |k| {
++                const ln = &g.lanes[k.lane];
++                try ln.live.appendSlice(g.gpa, ln.window[0..k.keep]);
++                ln.pending_rows = 0;
++            }
++        }
 +        for (requests, 0..) |r, i| {
 +            const ln = try g.enter(r.stream);
 +            idx[i] = g.n.e.lane;
@@ -10268,7 +10348,7 @@ index 0000000..10dd3ec
 +            .hidden_rows = true,
 +            .draft_streams = true, // a shared round's drafts in one call: DFlash2's block passes share one (draftDflashLanes)
 +            .streams_exact = true,
-+            .batch_rows = max_rows,
++            .batch_rows = @intCast(g.sharedRows()),
 +            .max_streams = max_lanes,
 +        };
 +    }
@@ -10276,11 +10356,11 @@ index 0000000..10dd3ec
 +    /// Shared windows of 2 to max_rows rows over lanes 0 and 1 (half each), timed on whatever their caches hold (both
 +    /// ranks run them; no commit, so the lanes stay where they were). Serving overwrites the rows they wrote.
 +    fn measureShared(g: *Glm) !void {
-+        var ids: [max_rows]u32 = undefined;
++        var ids: [fwd.Engine.shared_rows]u32 = undefined;
 +        for (&ids, 0..) |*t, i| t.* = @intCast(3000 + 37 * i);
 +        var out: [max_rows]u32 = undefined;
 +        g.shared[0] = g.costs[0];
-+        for (2..max_rows + 1) |total| {
++        for (2..g.sharedRows() + 1) |total| {
 +            const segs = [2]fwd.Engine.Seg{ .{ .lane = 0, .rows = (total + 1) / 2 }, .{ .lane = 1, .rows = total / 2 } };
 +            var best: f64 = std.math.inf(f64);
 +            for (0..3) |_| {
@@ -10291,7 +10371,12 @@ index 0000000..10dd3ec
 +            }
 +            g.shared[total - 1] = .{ .width = @intCast(total), .ms = best };
 +        }
-+        std.log.info("GLM shared window ms by rows (two lanes): 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}", .{ g.shared[1].ms, g.shared[3].ms, g.shared[7].ms, g.shared[max_rows - 1].ms });
++        std.log.info("GLM shared window ms by rows (two lanes): 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}, {d} {d:.1}", .{ g.shared[1].ms, g.shared[3].ms, g.shared[7].ms, g.shared[15].ms, g.sharedRows(), g.shared[g.sharedRows() - 1].ms });
++    }
++
++    /// A shared round's rows at most: fwd.Engine.shared_rows over the segmented kernels, else the lanes' own max_rows.
++    fn sharedRows(g: *const Glm) usize {
++        return if (g.n.e.seg_enabled) fwd.Engine.shared_rows else max_rows;
 +    }
 +
 +    /// Each window width's forward and one chained MTP step, timed on a short dummy prompt (both ranks run it).
@@ -10517,7 +10602,8 @@ index 0000000..10dd3ec
 +    if (g.drafts and g.copy_cfg.on) std.log.info("GLM copy drafts: up to {d} a round, match {d} tokens, {d} inside the reply, windows of 9 to 15 rows padded to {d}", .{ g.copy_cfg.most, g.copy_cfg.match, g.copy_cfg.reply_match, g.copy_cfg.pad });
 +    g.io = io;
 +    try g.measure(io);
-+    g.shared = g.costs;
++    @memcpy(g.shared[0..max_rows], &g.costs);
++    for (g.shared[max_rows..]) |*c| c.* = .{ .width = 0, .ms = 0 }; // width 0: left out (lanes config); measureShared fills them
 +    return .{ .backend = g.backend(), .facts = g.facts(), .rows = if (g.drafts) max_rows else 1, .stream_bytes = n.laneBytes(), .ctx = g, .deinit = release };
 +}
 +
@@ -10626,10 +10712,10 @@ index 0000000..10dd3ec
 +}
 diff --git a/zig/src/families/glm/cuda/glm_node.zig b/zig/src/families/glm/cuda/glm_node.zig
 new file mode 100644
-index 0000000..ba791ee
+index 0000000..4fc9cf6
 --- /dev/null
 +++ b/zig/src/families/glm/cuda/glm_node.zig
-@@ -0,0 +1,454 @@
+@@ -0,0 +1,481 @@
 +//! One rank of the two-rank GLM engine and the commands that keep the ranks in step: rank 0 sends each command to
 +//! rank 1 over the TCP pair before running it, rank 1 runs the same commands in the same order. Every token the
 +//! ranks pick comes from the same all-gather, so they agree without sending results back.
@@ -10646,7 +10732,7 @@ index 0000000..ba791ee
 +
 +const Engine = fwd.Engine;
 +
-+pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16, dflash_blocks = 17 };
++pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16, dflash_blocks = 17, keep_lanes = 18 };
 +
 +/// TF_GLM_DRAFTER_DIR: the DFlash2 draft model's snapshot folder (v1.8's DRAFTER=dflash2); unset: the MTP head drafts.
 +pub fn drafterDir() ?[]const u8 {
@@ -10950,6 +11036,26 @@ index 0000000..ba791ee
 +        try n.e.commit(rows, kept);
 +    }
 +
++    /// keep for several lanes of the last shared window at once (Engine.commitSegs).
++    pub fn keepLanes(n: *Node, items: []const Engine.Keep) !void {
++        n.words.clearRetainingCapacity();
++        try n.words.append(n.gpa, @intCast(items.len));
++        for (items) |it| try n.words.appendSlice(n.gpa, &.{ @intCast(it.lane), @intCast(it.rows), @intCast(it.keep) });
++        try n.send(.keep_lanes, n.words.items);
++        var segs: [Engine.max_lanes]Engine.Keep = undefined;
++        var m: usize = 0;
++        for (items) |it| {
++            if (it.lane < n.e.n_lanes and n.e.laneState(it.lane).seg) {
++                segs[m] = it;
++                m += 1;
++                continue;
++            }
++            try n.bind(it.lane); // a window it ran alone: its own commit
++            try n.e.commit(it.rows, it.keep);
++        }
++        try n.e.commitSegs(segs[0..m]);
++    }
++
 +    /// Absorb (hidden row, following token) pairs and draft `out.len` tokens.
 +    pub fn draft(n: *Node, from: From, next: []const u32, out: []u32) !void {
 +        n.words.clearRetainingCapacity();
@@ -11075,6 +11181,13 @@ index 0000000..ba791ee
 +                    var ls: [Engine.max_lanes]usize = undefined;
 +                    for (0..m) |i| ls[i] = w[1 + i];
 +                    try n.dflashBlocks(ls[0..m], w[1 + m ..][0..m]);
++                },
++                .keep_lanes => {
++                    const m = w[0];
++                    var items: [Engine.max_lanes]Engine.Keep = undefined;
++                    if (m > Engine.max_lanes) return error.TooManySegments;
++                    for (0..m) |i| items[i] = .{ .lane = w[1 + 3 * i], .rows = w[2 + 3 * i], .keep = w[3 + 3 * i] };
++                    try n.keepLanes(items[0..m]);
 +                },
 +                .bind => try n.bind(w[0]),
 +                .grow => _ = try n.grow(w[0]),
@@ -11346,7 +11459,7 @@ index 0000000..a675bcb
 +};
 diff --git a/zig/src/families/glm/cuda/glm_segments.zig b/zig/src/families/glm/cuda/glm_segments.zig
 new file mode 100644
-index 0000000..53b2605
+index 0000000..3dbe7b3
 --- /dev/null
 +++ b/zig/src/families/glm/cuda/glm_segments.zig
 @@ -0,0 +1,87 @@
@@ -11358,8 +11471,8 @@ index 0000000..53b2605
 +
 +/// segments.MAX_SEGS: lanes a window holds at most.
 +pub const max_segs = 8;
-+/// fwd.Engine.max_rows: a window's rows at most.
-+pub const max_rows = 16;
++/// fwd.Engine.shared_rows: a shared window's rows at most (v1.10's TF_GLM_MULTI_WINDOW default).
++pub const max_rows = 32;
 +/// sparse.POOL: tokens a pooled key covers.
 +pub const pool = 4;
 +/// fwd.extent (segments.EXTENT): a lane's arena extent starts at a multiple of this many tokens.
@@ -11435,7 +11548,7 @@ index 0000000..53b2605
 +    try std.testing.expectEqualSlices(i32, &.{ 513, 0 }, t[SegRows.pools_at..][0..2]); // (2051 + 1) / 4; lane 1 dense
 +    try std.testing.expect(SegRows.anySparse(&t, r));
 +    try std.testing.expectError(error.BadSegment, SegRows.fill(&.{.{ .base = 100, .pos = 0, .rows = 1 }}, null, &t));
-+    try std.testing.expectError(error.WindowTooWide, SegRows.fill(&.{ .{ .base = 0, .pos = 0, .rows = 9 }, .{ .base = 2048, .pos = 0, .rows = 8 } }, null, &t));
++    try std.testing.expectError(error.WindowTooWide, SegRows.fill(&.{ .{ .base = 0, .pos = 0, .rows = 17 }, .{ .base = 2048, .pos = 0, .rows = 16 } }, null, &t));
 +}
 diff --git a/zig/src/families/glm/cuda/glm_source.zig b/zig/src/families/glm/cuda/glm_source.zig
 new file mode 100644

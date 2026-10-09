@@ -545,12 +545,19 @@ dropped before each run, prompts made unique so neither engine resumes a kept st
 
 | Four requests at once, aggregate | v1.10, `PARALLEL=4` | native, `PARALLEL=4` (262,144) |
 |---|---|---|
-| Four different prompts, greedy / sampled | 88.2 / 88.3 tokens/s | 80.7 / 80.7 tokens/s |
+| Four different prompts, 256-token replies, greedy | 88.2 tokens/s | 81.2 tokens/s |
+| Four different prompts, 1,024-token replies, greedy / sampled | 101.7 / 101.4 tokens/s | 92.4 tokens/s (greedy) |
 | One code prompt four times, sampled | 101.1 tokens/s | 89.0-92.4 tokens/s |
 
 Replies are token for token v1.10's on its reference sets (116 of 116, DFlash2 and copy drafts, RoCE), and four at
 once equal the same requests one at a time and drafted equal serial (`tools/bench_concurrent.py --alone --serial`,
-every cell). A native round of four is about 110 ms: the shared window's forward 72-94 ms for ~11 rows, DFlash2 9 ms.
+every cell). Shared windows take up to 32 rows across the requests (v1.10's `TF_GLM_MULTI_WINDOW` default), each
+request's own part up to 16. Where the rest goes, four different prompts with 1,024-token replies, averaged over
+rounds: native 118 ms a round for 13.2 rows (forward 107, DFlash2 8.6 of which block passes 6.0), v1.10 108 ms for
+12.6 rows (verify 101, DFlash2 4.5). A shared window costs more than one request's window of the same rows (8 rows:
+75.8 ms over two requests, 64.8 alone); v1.10's does too, by less. Short replies add one more difference: v1.10
+prefills prompts that arrive together in one pass, the native engine one after another (four short prompts: last
+first token 0.44-0.67 s, v1.10 0.15-0.24 s).
 
 **What it does not have yet**, against v1.8 (measured on two Sparks, `Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit`):
 
