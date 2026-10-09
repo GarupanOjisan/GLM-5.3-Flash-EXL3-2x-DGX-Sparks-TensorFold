@@ -31,6 +31,13 @@ Every change to this recipe, newest first. Each release names the image it serve
   in shared rounds. Four different prompts: 86.1 tokens/s at 256-token replies (v1.10 88.2), 97.1 at 1,024 (v1.10
   101.7), was 80.7 and 90.6. A fix on the way: with 32-row windows the sparse selection's scratch was still sized for
   16 rows, and requests past 2,051 tokens served together failed (`CUDA_ERROR_ILLEGAL_ADDRESS`).
+- **New prompts no longer stall the others.** A new prompt's chunks alternate with the other requests' decode rounds
+  and each request opens when its own prompt is in (12-, 300-, 900- and 2,600-word prompts together: first tokens
+  0.16 / 0.74 / 1.9 / 5.2 s, were 0.16 then 4.9 s for the rest; the shortest reply's longest pause 1.2 s, was 4.8 s).
+  The server's backend wrapper now passes the multi-prompt prefill through (it never reached the lanes core before).
+  DFlash2's layer matmuls on the 32-row tile and its taps for every lane in one graph. Same session as v1.10: four
+  different prompts 86.3 / 85.7 tokens/s at 256-token replies greedy / sampled (v1.10 89.4 / 89.3), 97.7 / 97.5 at
+  1,024 (v1.10 101.4 / 101.3).
 
 ## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
 
