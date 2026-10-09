@@ -25,6 +25,12 @@ Every change to this recipe, newest first. Each release names the image it serve
   97-99% of its speed, token for token its replies (116 of 116); four different prompts at once, 80.7 tokens/s
   aggregate (v1.10 88.2), each reply equal to the same request alone. `start-native.sh` passes `PARALLEL` (default 4)
   and then defaults to a 262,144-token window: each request gets a window of its own, and four at 1,048,576 do not fit.
+- **Four requests at once closer to v1.10.** Shared windows of up to 32 rows (v1.10's `TF_GLM_MULTI_WINDOW`; 16 cut
+  four requests' drafts), the 4-bit matmuls and DFlash2's head on a 32-row tile past 16 rows, every lane's commit and
+  DFlash2 block pass in one launch set, prompts that arrive together prefilled in shared chunks, and no depth policy
+  in shared rounds. Four different prompts: 86.1 tokens/s at 256-token replies (v1.10 88.2), 97.1 at 1,024 (v1.10
+  101.7), was 80.7 and 90.6. A fix on the way: with 32-row windows the sparse selection's scratch was still sized for
+  16 rows, and requests past 2,051 tokens served together failed (`CUDA_ERROR_ILLEGAL_ADDRESS`).
 
 ## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
 

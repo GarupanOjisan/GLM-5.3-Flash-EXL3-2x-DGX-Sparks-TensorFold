@@ -4074,10 +4074,10 @@ index 0000000..9fb9776
 +}
 diff --git a/zig/kernels/cuda/qmm.cu b/zig/kernels/cuda/qmm.cu
 new file mode 100644
-index 0000000..b16c064
+index 0000000..dd52f1c
 --- /dev/null
 +++ b/zig/kernels/cuda/qmm.cu
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,279 @@
 +// Device code of src/tensorfold/cuda/kernels/qmm.cu [v1.8] (lines 1-253, ATen includes dropped), checked by zig/tests/cuda/copies.py.
 +// Lane matmul: acc = fma(xs, b, fma(P, s, acc)) per group in order, K slices set by shape, so no row affects another.
 +
@@ -4348,6 +4348,15 @@ index 0000000..b16c064
 +TF_QMM_ALL(64, 4, 4)
 +TF_QMM_ALL(128, 8, 4)
 +TF_QMM_ALL(128, 4, 6)
++// A shared window of 17 to 32 rows on one 32-row tile (qmm.py bucket, qmm.cu dispatch case 32): each weight read once.
++#define TF_QMM32(F32, CLUSTER)                                                                                  \
++    template __global__ void tf_qmm::qmm_kernel<64, 32, 64, 1, 4, 4, F32, CLUSTER, false>(                     \
++        const __nv_bfloat16*, const float*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, \
++        float*, int, int, int, int, int, int, int);
++TF_QMM32(false, false)
++TF_QMM32(false, true)
++TF_QMM32(true, false)
++TF_QMM32(true, true)
 diff --git a/zig/kernels/cuda/qmm_prefill.cu b/zig/kernels/cuda/qmm_prefill.cu
 index 1610b22..56b8f41 100644
 --- a/zig/kernels/cuda/qmm_prefill.cu
@@ -4375,6 +4384,178 @@ index 4803932..8f3e21b 100644
      /// A line the server prints once at startup (the engine's memory plan); empty: none.
      startup: []const u8 = "",
  };
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index ea6c57f..30c0251 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -277,18 +277,56 @@ pub const LaneHost = struct {
+         h.mutex.unlock(h.io);
+     }
+ 
+-    /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
+-    fn admitOne(h: *LaneHost) bool {
++    /// Prefills the queued requests that fit the free lanes, together (Engine.addStreams: their prompts may share prompt
++    /// passes); false when none waits or no lane is free.
++    fn admitMany(h: *LaneHost) bool {
++        var jobs: [max_admit]*Job = undefined;
++        var n: usize = 0;
++        var took = false;
++        while (n < jobs.len) {
++            var one = false;
++            const job = h.prepare(&one) orelse if (one) {
++                took = true;
++                continue;
++            } else break;
++            took = true;
++            jobs[n] = job;
++            n += 1;
++        }
++        if (n == 0) return took;
++        if (n == 1 and h.loneFits(jobs[0])) return h.runLone(jobs[0], jobs[0].began);
++        var streams: [max_admit]*lanes.Stream = undefined;
++        var errs: [max_admit]?anyerror = undefined;
++        for (jobs[0..n], streams[0..n]) |job, *s| s.* = &job.stream;
++        h.core.addStreams(streams[0..n], errs[0..n]);
++        for (jobs[0..n], errs[0..n]) |job, er| {
++            if (er) |e| {
++                _ = if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
++                continue;
++            }
++            h.prefilled(job, job.began);
++            if (h.deliver(job)) h.remove(job);
++        }
++        return true;
++    }
++
++    const max_admit = 16;
++
++    /// The next queued request taken into a free lane with its stream set up (not yet prefilled); null when none waits
++    /// or no lane is free (`took` false), or when the one taken failed here (`took` true, the job finished).
++    fn prepare(h: *LaneHost, took: *bool) ?*Job {
++        took.* = false;
+         h.lock();
+         if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
+             h.unlock();
+-            return false;
++            return null;
+         }
++        took.* = true;
+         const job = h.queued.orderedRemove(0);
+         h.admitted.append(h.gpa, job) catch {
+             h.unlock();
+             h.finish(job, .failed, "out of memory");
+-            return true;
++            return null;
+         };
+         h.unlock();
+         const r = job.request;
+@@ -300,7 +338,10 @@ pub const LaneHost = struct {
+             job.marks = l.marks;
+             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
+         } else |_| {};
+-        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
++        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch {
++            _ = h.drop(job, "the drafter could not start");
++            return null;
++        };
+         job.stream = lanes.Stream.init(h.gpa, .{
+             .id = "request",
+             .prompt = r.prompt,
+@@ -319,16 +360,12 @@ pub const LaneHost = struct {
+             .reuse = reuse,
+         }) catch {
+             job.proposer.deinit();
+-            return h.drop(job, "out of memory");
++            _ = h.drop(job, "out of memory");
++            return null;
+         };
+         job.started = true;
+-        const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
+-        job.began = began;
+-        if (h.loneFits(job)) return h.runLone(job, began);
+-        h.core.addStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
+-        h.prefilled(job, began);
+-        if (h.deliver(job)) h.remove(job);
+-        return true;
++        job.began = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        return job;
+     }
+ 
+     fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
+@@ -437,7 +474,7 @@ pub const LaneHost = struct {
+     fn run(h: *LaneHost) void {
+         while (true) {
+             h.takeCancels();
+-            while (h.admitOne()) {}
++            while (h.admitMany()) {}
+             h.noteLive();
+             h.lock();
+             if (h.closing) {
+diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
+index ee95dc6..6018392 100644
+--- a/zig/src/core/lanes/backend.zig
++++ b/zig/src/core/lanes/backend.zig
+@@ -71,11 +71,17 @@ pub const Backend = struct {
+         alternatives: ?*const fn (ptr: *anyopaque, s: *Stream, out: []Alternative) anyerror!usize = null,
+         /// The stream left the rounds: free its caches and held drafts.
+         release: *const fn (ptr: *anyopaque, s: *Stream) void,
++        /// Prefill several streams admitted together (their prompts may share prompt passes); null: one `prefill` each.
++        /// A cancelled stream may be left part-way; the core releases it.
++        prefill_many: ?*const fn (ptr: *anyopaque, streams: []*Stream) anyerror!void = null,
+     };
+ 
+     pub fn prefill(b: Backend, s: *Stream) !void {
+         return b.vtable.prefill(b.ptr, s);
+     }
++    pub fn prefillMany(b: Backend, streams: []*Stream) !void {
++        return (b.vtable.prefill_many orelse return error.NoGroupedPrefill)(b.ptr, streams);
++    }
+     pub fn first(b: Backend, s: *Stream, position: u64) !u64 {
+         return b.vtable.first(b.ptr, s, position);
+     }
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 1199e77..32e98f0 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -83,6 +83,38 @@ pub const Engine = struct {
+             if (err == error.Cancelled) e.backend.release(s); // the host finishes a cancelled stream without the core
+             return err;
+         };
++        return e.opened(s);
++    }
++
++    /// addStream for streams admitted together: one Backend.prefillMany (their prompts may share passes), then each
++    /// stream's first token and drafts in order. errs[i]: stream i's error (a failed prefill: every stream's), or null.
++    pub fn addStreams(e: *Engine, streams: []*Stream, errs: []?anyerror) void {
++        if (streams.len == 1 or e.backend.vtable.prefill_many == null) { // one stream at a time, each opened before the next
++            for (streams, errs) |s, *er| er.* = if (e.addStream(s)) null else |err| err;
++            return;
++        }
++        _ = e.arena.reset(.retain_capacity);
++        @memset(errs, null);
++        for (streams) |s| trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) }) catch |err| {
++            @memset(errs, err);
++            return;
++        };
++        e.backend.prefillMany(streams) catch |err| {
++            for (streams, errs) |s, *er| {
++                if (s.isCancelled()) e.backend.release(s);
++                er.* = if (s.isCancelled()) error.Cancelled else err;
++            }
++            return;
++        };
++        for (streams, errs) |s, *er| {
++            e.opened(s) catch |err| {
++                er.* = err;
++            };
++        }
++    }
++
++    /// A prefilled stream's first token and first drafts; it joins the rounds.
++    fn opened(e: *Engine, s: *Stream) !void {
+         if (s.isCancelled()) { // cancelled in its last chunk: no first token
+             e.backend.release(s);
+             return error.Cancelled;
 diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
 index 3709e4c..685082e 100644
 --- a/zig/src/cuda/kernels.zig
@@ -4957,10 +5138,10 @@ index 0000000..4612953
 +}
 diff --git a/zig/src/families/glm/cuda/glm_dflash.zig b/zig/src/families/glm/cuda/glm_dflash.zig
 new file mode 100644
-index 0000000..9621dbe
+index 0000000..ba35464
 --- /dev/null
 +++ b/zig/src/families/glm/cuda/glm_dflash.zig
-@@ -0,0 +1,954 @@
+@@ -0,0 +1,960 @@
 +//! DFlash2 drafts for GLM-5.3-Flash on two CUDA ranks (v1.8 glm5_next/cuda/dflash2.py, the single-stream `Drafter`): a five
 +//! layer block model with two-tap dynamic convolutions and sliding-window attention reads the means of the target's streams
 +//! at five layers (the "taps" of every committed row) and, for [pending token, mask x (block - 1)], proposes candidates for
@@ -5865,10 +6046,16 @@ index 0000000..9621dbe
 +        for (0..dr.layers.len) |i| try b.layer(e, ds, i);
 +        for (0..S) |s| try b.norm(e, b.x + (s * n + 1) * D * bf, dr.norm, b.hh + s * nb * D * bf, b.hh_xs + s * nb * (D / 64) * f4, nb);
 +        const vl = b.w.head.n;
-+        var r: usize = 0;
-+        while (r < M) : (r += piece) {
-+            const m = @min(piece, M - r);
-+            try kern.q4Matmul(e.k, e.s, b.hh + r * D * bf, b.hh_xs + r * (D / 64) * f4, b.w.draft_head, b.logits + r * vl * bf, m);
++        if (M > piece and M <= 2 * piece) {
++            // one launch on the 32-row tile reads the head once (v1.10's qmm bucket); the drafts are hints, so these bits
++            // need not be the one-lane pass's
++            try kern.qmmShared(e.k, e.s, b.hh, D, b.hh_xs, b.w.draft_head, b.logits, M, false);
++        } else {
++            var r: usize = 0;
++            while (r < M) : (r += piece) {
++                const m = @min(piece, M - r);
++                try kern.q4Matmul(e.k, e.s, b.hh + r * D * bf, b.hh_xs + r * (D / 64) * f4, b.w.draft_head, b.logits + r * vl * bf, m);
++            }
 +        }
 +        var a: cuda.Args = .{};
 +        a.add(b.logits);
@@ -5917,10 +6104,10 @@ index 0000000..9621dbe
 +};
 diff --git a/zig/src/families/glm/cuda/glm_forward.zig b/zig/src/families/glm/cuda/glm_forward.zig
 new file mode 100644
-index 0000000..d07e521
+index 0000000..f44d225
 --- /dev/null
 +++ b/zig/src/families/glm/cuda/glm_forward.zig
-@@ -0,0 +1,2185 @@
+@@ -0,0 +1,2315 @@
 +//! GLM-5.3-Flash's tensor-parallel forward, MTP step and commit on CUDA, launch for launch as the Python engine runs
 +//! them (v0.6.6 families/glm5_next/cuda/forward.py and mtp.py, TF_GLM_LATENT=1, the EXL3 checkpoint), eagerly:
 +//! every buffer is static, positions live on the device, and the host knows them too (Python's host_pos path).
@@ -6550,6 +6737,7 @@ index 0000000..d07e521
 +    /// a side stream (glm_l2pf.zig); `l2pf_active` is set while such a window runs.
 +    l2pf: ?l2pf.Prefetch = null,
 +    l2pf_active: bool = false,
++    pieces: []const Piece = &.{}, // a multi-prompt chunk's pieces while it runs (prefillPieces)
 +    hc_mma: bool = true,
 +    /// TF_GLM_LATENT_MMA / TF_GLM_SPARSE_ONEPASS (default on): a prompt chunk's absorb and expand on the tensor cores, its
 +    /// sparse attention in one pass a row.
@@ -6644,6 +6832,7 @@ index 0000000..d07e521
 +        e.capturing = false;
 +        e.nuc_dev = null;
 +        e.nuc_host = &.{};
++        e.pieces = &.{};
 +        e.l2pf_active = false; // `e` starts undefined, so every field with a default but no assignment here is garbage
 +        e.draft_head = w.draft_head;
 +        e.full_dev = try cuda.DeviceBuffer.alloc(d, wt.world * max_rows * w.head.n * bf);
@@ -6882,13 +7071,17 @@ index 0000000..d07e521
 +        switch (q.kind) {
 +            .b16 => try e.t.matmulB16(x, x_stride, q.ptr, out, b.sk, rows, q.n, q.k, wide),
 +            .q4 => if (b.prefill) try kern.q4Prefill(e.k, e.s, x, x_stride, q.q4(), out, rows, wide) else {
-+                // qmm_cfg takes 16 rows a launch: a shared window past that in 16-row pieces, each row's arithmetic as alone
++                // a shared window past 16 rows on the 32-row tile (each weight read once; a row's bits as on its lane's 16)
 +                const qq = q.q4();
-+                const ob: usize = if (wide) f4 else bf;
-+                var r: usize = 0;
-+                while (r < rows) : (r += max_rows) {
-+                    const m = @min(max_rows, rows - r);
-+                    try kern.qmmDecode(e.k, e.s, x + r * x_stride * bf, x_stride, xs + r * (qq.k / 64) * f4, qq, out + r * qq.n * ob, m, wide);
++                if (rows > max_rows and envOn("TF_GLM_QMM32")) {
++                    try kern.qmmShared(e.k, e.s, x, x_stride, xs, qq, out, rows, wide);
++                } else {
++                    const ob: usize = if (wide) f4 else bf;
++                    var r: usize = 0;
++                    while (r < rows) : (r += max_rows) {
++                        const m = @min(max_rows, rows - r);
++                        try kern.qmmDecode(e.k, e.s, x + r * x_stride * bf, x_stride, xs + r * (qq.k / 64) * f4, qq, out + r * qq.n * ob, m, wide);
++                    }
 +                }
 +            },
 +            .f8 => {
@@ -6949,6 +7142,21 @@ index 0000000..d07e521
 +            try e.mm(b, ga, e.width, b.xs_ga, kw.gb, b.kg, rows, false);
 +            try e.pfSite(l.index, 2);
 +        }
++        try e.kdaState(l, b, rows, host_pos);
++        const scr_out = if (b.prefill) b.kscr.out else st.scr.out + li * max_rows * ll * 128 * bf;
++        if (!b.prefill) try e.t.groupSums(scr_out, ll * 128, b.kxs, rows, ll * 128);
++        return e.outProj(b, scr_out, b.kxs, kw.o, rows, .{ l.index, 0 });
++    }
++
++    /// kdaBlock's state work after its projections (b.kproj or the lane's proj): the chain over the KDA state and, for a
++    /// prompt chunk, the conv window's move; the rows' outputs in the scratch's `out`.
++    fn kdaState(e: *Engine, l: *const wt.Layer, b: *const Buffers, rows: usize, host_pos: usize) !void {
++        const c = e.w.cfg;
++        const kw = l.kda.?;
++        const li: usize = e.st.kda_index[l.index];
++        const ll: usize = c.kda_heads / wt.world;
++        const st = &e.st;
++        const p = if (b.prefill) b.kproj else st.proj + li * max_rows * e.width * bf;
 +        const rec_layer = ll * 128 * 128 * f4;
 +        const rec_half = st.kda_layers * rec_layer;
 +        const scr: KdaScratch = if (b.prefill) b.kscr else .{ .out = st.scr.out + li * max_rows * ll * 128 * bf, .k = st.scr.k + li * max_rows * ll * 128 * f4, .v = st.scr.v + li * max_rows * ll * 128 * bf, .g = st.scr.g + li * max_rows * ll * 128 * f4, .b = st.scr.b + li * max_rows * ll * f4 };
@@ -6986,8 +7194,6 @@ index 0000000..d07e521
 +            // a prompt chunk keeps every row: the layer's conv window moves now (its state half flips in prefillChunk)
 +            try e.t.convShift(st.conv + li * conv_layer, b.kproj, rows, 1, 3 * ll * 128, 3 * 3 * ll * 128, b.rows * e.width, e.width);
 +        }
-+        if (!b.prefill) try e.t.groupSums(scr.out, ll * 128, b.kxs, rows, ll * 128);
-+        return e.outProj(b, scr.out, b.kxs, kw.o, rows, .{ l.index, 0 });
 +    }
 +
 +    /// forward.dsa_front: DSA's projection, query and latent norms and query expansion of rows lo .. hi (row-independent).
@@ -7011,10 +7217,20 @@ index 0000000..d07e521
 +        const c = e.w.cfg;
 +        const a = l.dsa.?;
 +        const hl: usize = c.mla_heads / wt.world;
++        for (undone(rows, done)) |r| if (r[1] > r[0]) try e.dsaFront(l, b, r[0], r[1]);
++        try e.dsaState(l, b, kc, pos_dev, host_pos, index, rows);
++        try e.t.groupSums(b.vn, hl * c.v_dim, b.xs_ao, rows, hl * c.v_dim);
++        return e.outProj(b, b.vn, b.xs_ao, a.o, rows, .{ l.index, 0 });
++    }
++
++    /// dsaBlock after its fronts: the latent write, the indexer, absorb, dense or sparse attention and expand into b.vn.
++    fn dsaState(e: *Engine, l: *const wt.Layer, b: *const Buffers, kc: u64, pos_dev: u64, host_pos: usize, index: ?[3]u64, rows: usize) !void {
++        const c = e.w.cfg;
++        const a = l.dsa.?;
++        const hl: usize = c.mla_heads / wt.world;
 +        const qk: usize = c.nope;
 +        const lw: usize = c.kv_lora;
 +        const dense_limit = denseLimit(e.w);
-+        for (undone(rows, done)) |r| if (r[1] > r[0]) try e.dsaFront(l, b, r[0], r[1]);
 +        // _dsa_latent
 +        try e.t.latentWrite(b.lat, c.kv_lora, kc, pos_dev, rows, lw);
 +        const all_sparse = host_pos >= dense_limit;
@@ -7060,8 +7276,6 @@ index 0000000..d07e521
 +            } else try e.t.sparseAttention(b.qa, kc, b.tokens, b.counts, b.ol, b.spo, b.spm, b.spl, rows, hl, lw, tri.select_width, scale);
 +        }
 +        if (b.prefill and e.latent_mma) try e.t.expandVMma(b.ol, a.wv, b.vn, rows, hl, c.v_dim, lw) else try e.t.expandV(b.ol, a.wv, b.vn, rows, hl, c.v_dim, lw);
-+        try e.t.groupSums(b.vn, hl * c.v_dim, b.xs_ao, rows, hl * c.v_dim);
-+        return e.outProj(b, b.vn, b.xs_ao, a.o, rows, .{ l.index, 0 });
 +    }
 +
 +    /// TORCH-GLUE `pos_dev + r0`: block j's first position into its own 16-byte slot (the host knows pos).
@@ -7162,6 +7376,7 @@ index 0000000..d07e521
 +
 +    /// The layer's KDA or DSA block on b.normed (forward._mixer).
 +    fn mixer(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize, host_pos: usize, done: ?[2]usize) !u64 {
++        if (b.prefill and e.pieces.len > 0) return e.mixPieces(l, b, rows, done);
 +        return switch (l.kind) {
 +            .kda => try e.kdaBlock(l, b, rows, host_pos, done),
 +            .mla => blk: {
@@ -7169,6 +7384,108 @@ index 0000000..d07e521
 +                break :blk try e.dsaBlock(l, b, e.st.kc[di], e.st.pos_dev, host_pos, if (e.st.long_context) e.st.index[di] else null, rows, done);
 +            },
 +        };
++    }
++
++    // -- multi-prompt chunks (v1.10 multi_prefill) -----------------------------------------------------------------
++    /// A lane's rows of a multi-prompt chunk: its next `rows` prompt rows from its position, at row `lo` of the prompt
++    /// buffers (a multiple of 64, so each row keeps the place in the prompt kernels' 64-row tiles a chunk of its own gives it).
++    pub const Piece = struct { lane: usize, rows: usize, lo: usize };
++
++    /// multi_prefill.PieceMixer: the block's fronts and output projection over every row; its state work piece by piece,
++    /// on the piece's lane at its position, through the calls a chunk of its own makes (the piece's rows a view at `lo`).
++    fn mixPieces(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize, done: ?[2]usize) !u64 {
++        const c = e.w.cfg;
++        const home = e.lane;
++        switch (l.kind) {
++            .kda => {
++                const kw = l.kda.?;
++                for (undone(rows, done)) |r| if (r[1] > r[0]) try e.kdaFront(l, b, r[0], r[1]);
++                for (e.pieces) |pc| {
++                    try e.bind(pc.lane);
++                    const v = e.pieceView(b, pc.lo);
++                    try e.kdaState(l, &v, pc.rows, e.st.pos);
++                }
++                try e.bind(home);
++                return e.outProj(b, b.kscr.out, b.kxs, kw.o, rows, .{ l.index, 0 });
++            },
++            .mla => {
++                const a = l.dsa.?;
++                const hl: usize = c.mla_heads / wt.world;
++                for (undone(rows, done)) |r| if (r[1] > r[0]) try e.dsaFront(l, b, r[0], r[1]);
++                for (e.pieces) |pc| {
++                    try e.bind(pc.lane);
++                    const v = e.pieceView(b, pc.lo);
++                    const di: usize = e.st.dsa_index[l.index];
++                    try e.dsaState(l, &v, e.st.kc[di], e.st.pos_dev, e.st.pos, if (e.st.long_context) e.st.index[di] else null, pc.rows);
++                }
++                try e.bind(home);
++                try e.t.groupSums(b.vn, hl * c.v_dim, b.xs_ao, rows, hl * c.v_dim);
++                return e.outProj(b, b.vn, b.xs_ao, a.o, rows, .{ l.index, 0 });
++            },
++        }
++    }
++
++    /// The prompt buffers from row `lo` on, for kdaState and dsaState: every buffer they index by row moves; their
++    /// scratch (attention partials, selection, block positions) stays, a piece's work running before the next one's.
++    fn pieceView(e: *const Engine, b: *const Buffers, lo: usize) Buffers {
++        const c = e.w.cfg;
++        const ll: usize = c.kda_heads / wt.world;
++        const hl: usize = c.mla_heads / wt.world;
++        const kh = ll * 128;
++        var v = b.*;
++        v.normed += lo * c.hidden * bf;
++        v.xs += lo * c.hidden / 64 * f4;
++        v.kproj += lo * e.width * bf;
++        v.ka += lo * kh * bf;
++        v.kg += lo * kh * bf;
++        v.kscr = .{ .out = b.kscr.out + lo * kh * bf, .k = b.kscr.k + lo * kh * f4, .v = b.kscr.v + lo * kh * bf, .g = b.kscr.g + lo * kh * f4, .b = b.kscr.b + lo * ll * f4 };
++        if (b.q_tmp != 0) v.q_tmp += lo * kh * f4;
++        if (b.y_tmp != 0) v.y_tmp += lo * kh * bf;
++        v.qr += lo * c.q_lora * bf;
++        v.xs_qr += lo * c.q_lora / 64 * f4;
++        v.lat += lo * c.kv_lora * bf;
++        v.q += lo * hl * c.nope * bf;
++        v.ikr += lo * (c.i_dim + c.i_heads) * bf;
++        v.igr += lo * c.i_dim * f4;
++        v.qi += lo * c.i_heads * c.i_dim * bf;
++        v.qa += lo * hl * c.kv_lora * bf;
++        v.ol += lo * hl * c.kv_lora * bf;
++        v.vn += lo * hl * c.v_dim * bf;
++        v.tokens += lo * tri.select_width * 4;
++        v.counts += lo * 4;
++        return v;
++    }
++
++    /// multi_prefill.prefill_pieces up to the commits: one prompt chunk over every piece (`ids`: the chunk's rows, a
++    /// piece's tokens at its `lo`, the rows between pieces any token), then per piece the head on its last row and that
++    /// row's hidden state into its lane's last_logits and last_hidden, as prefillChunk leaves them. The taps and each
++    /// lane's commitChunk are the caller's (Node.chunkLanes).
++    pub fn prefillPieces(e: *Engine, pieces: []const Piece, ids: []const u32) !void {
++        const d: usize = e.w.cfg.hidden;
++        const b = &e.pbuf;
++        const R = ids.len;
++        if (pieces.len == 0 or pieces.len > max_lanes or R > b.rows) return error.BadChunk;
++        const home = e.lane;
++        for (pieces, 0..) |pc, i| {
++            if (pc.rows == 0 or pc.lo % 64 != 0 or pc.lo + pc.rows > R) return error.BadChunk;
++            if (i > 0 and pc.lo < pieces[i - 1].lo + pieces[i - 1].rows) return error.BadChunk;
++            for (pieces[0..i]) |o| if (o.lane == pc.lane) return error.BadChunk;
++            try e.bind(pc.lane);
++            try e.checkRoom(pc.rows, e.st.pos);
++        }
++        try e.bind(home);
++        try e.upload(b.ids, std.mem.sliceAsBytes(ids));
++        e.pieces = pieces;
++        defer e.pieces = &.{};
++        try e.compute(b, R);
++        for (pieces) |pc| {
++            const r = pc.lo + pc.rows - 1;
++            // prefillChunk's head: the last row times the head, with the group sums at its chunk's first row
++            try e.mm(b, b.fnormed + r * d * bf, d, b.fxs + pc.lo * (d / 64) * f4, e.w.head, b.logits, 1, false);
++            const st = e.laneState(pc.lane);
++            try e.copyDev(st.last_logits, b.logits, e.w.head.n * bf);
++            try e.copyDev(st.last_hidden, b.fnormed + r * d * bf, d * bf);
++        }
 +    }
 +
 +    fn layerForward(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize, host_pos: usize) !void {
@@ -7604,12 +7921,12 @@ index 0000000..d07e521
 +    // CUDA graph a row count serves every mix of lanes and positions. Each segment's rows get the bits of its lane's window
 +    // alone (the kernels' contract); the commit replays and shifts one lane's segment at a time (commitSeg).
 +
-+    /// The segmented selection's buffers (segments.SelectScratch): scores [max_rows, seg_pools], tokens, counts and the
++    /// The segmented selection's buffers (segments.SelectScratch): scores [shared_rows, seg_pools], tokens, counts and the
 +    /// split selection's scratch, allocated at the first segmented window of a long-context engine (outside any capture).
 +    fn segSelBuffers(e: *Engine) !void {
 +        if (e.seg_sel != null) return;
 +        const np = tri.Tri.seg_pools;
-+        const bytes = max_rows * np * f4 + max_rows * tri.select_width * 4 + max_rows * 4 + tri.Tri.splitInts(max_rows, np) * 4 + 4 * 256;
++        const bytes = shared_rows * np * f4 + shared_rows * tri.select_width * 4 + shared_rows * 4 + tri.Tri.splitInts(shared_rows, np) * 4 + 4 * 256;
 +        e.seg_sel = try cuda.DeviceBuffer.alloc(e.d, bytes);
 +    }
 +
@@ -7618,9 +7935,9 @@ index 0000000..d07e521
 +    fn segSel(e: *const Engine) SegSel {
 +        const base = e.seg_sel.?.ptr;
 +        const np = tri.Tri.seg_pools;
-+        const tokens = std.mem.alignForward(u64, base + max_rows * np * f4, 256);
-+        const counts = std.mem.alignForward(u64, tokens + max_rows * tri.select_width * 4, 256);
-+        const split = std.mem.alignForward(u64, counts + max_rows * 4, 256);
++        const tokens = std.mem.alignForward(u64, base + shared_rows * np * f4, 256);
++        const counts = std.mem.alignForward(u64, tokens + shared_rows * tri.select_width * 4, 256);
++        const split = std.mem.alignForward(u64, counts + shared_rows * 4, 256);
 +        return .{ .scores = base, .tokens = tokens, .counts = counts, .split = split };
 +    }
 +
@@ -8108,10 +8425,10 @@ index 0000000..d07e521
 +}
 diff --git a/zig/src/families/glm/cuda/glm_kernels.zig b/zig/src/families/glm/cuda/glm_kernels.zig
 new file mode 100644
-index 0000000..793adf5
+index 0000000..96d5c2b
 --- /dev/null
 +++ b/zig/src/families/glm/cuda/glm_kernels.zig
-@@ -0,0 +1,966 @@
+@@ -0,0 +1,993 @@
 +//! GLM's raw CUDA kernels (the glm_kda, glm_exl3 and glm_glue fatbins) launched with the Python host code's geometry
 +//! (glm_symbols.zig has the spec, with file:line references into v0.6.6).
 +const std = @import("std");
@@ -8155,6 +8472,8 @@ index 0000000..793adf5
 +    make_f8: cuda.Function,
 +    /// v1.8's decode matmul qmm_kernel by tile config (qmm_cfgs), fp32 out, K slices in a cluster.
 +    qmm: [qmm_cfgs.len][2][2]cuda.Function,
++    /// qmm_kernel on a 32-row tile (qmm32), fp32 out, K slices in a cluster.
++    qmm32: [2][2]cuda.Function,
 +    /// v1.8's routed-expert kernels (glm_exl3d: glm5_next/cuda/exl3.cu) and the plan kernels of experts.cu.
 +    rot_rows: cuda.Function,
 +    rot_pairs: cuda.Function,
@@ -8260,6 +8579,10 @@ index 0000000..793adf5
 +        inline for (qmm_cfgs, 0..) |c, i| inline for (.{ false, true }, 0..) |fp32, j| inline for (.{ false, true }, 0..) |cluster, l| {
 +            k.qmm[i][j][l] = try k.mods[6].function(comptime c.symbol(fp32, cluster));
 +            try k.qmm[i][j][l].allowDynamicShared(c.smem());
++            if (i == 0) {
++                k.qmm32[j][l] = try k.mods[6].function(comptime qmm32.symbol(fp32, cluster));
++                try k.qmm32[j][l].allowDynamicShared(qmm32.smem());
++            }
 +        };
 +        k.rot_rows = try k.mods[7].function(e18.rot_rows);
 +        k.rot_pairs = try k.mods[7].function(e18.rot_pairs);
@@ -8300,21 +8623,23 @@ index 0000000..793adf5
 +/// v1.8 qmm.cu's qmm_kernel<64, 16, bn, 1, wn, stages> for a decode window (rows <= 16). Config 0 is `qmm` with the
 +/// 16-row tile; 1 and 2 are `qmm_cfg` 2 and 4. dec_tile (glm qmm.py DEC_TILES) picks one by the projection's shape.
 +const QmmCfg = struct {
++    bm: u32 = 16,
 +    bn: u32,
 +    wn: u32,
 +    stages: u32,
 +
 +    fn symbol(c: QmmCfg, comptime fp32: bool, comptime cluster: bool) [:0]const u8 {
-+        return std.fmt.comptimePrint("_ZN6tf_qmm10qmm_kernelILi64ELi16ELi{d}ELi1ELi{d}ELi{d}ELb{d}ELb{d}ELb0EEEvPK13__nv_bfloat16PKfPKjS3_S3_PvPfiiiiiii", .{ c.bn, c.wn, c.stages, @intFromBool(fp32), @intFromBool(cluster) });
++        return std.fmt.comptimePrint("_ZN6tf_qmm10qmm_kernelILi64ELi{d}ELi{d}ELi1ELi{d}ELi{d}ELb{d}ELb{d}ELb0EEEvPK13__nv_bfloat16PKfPKjS3_S3_PvPfiiiiiii", .{ c.bm, c.bn, c.wn, c.stages, @intFromBool(fp32), @intFromBool(cluster) });
 +    }
 +
-+    /// Tile<64, 16, bn, 1, wn, stages>::SMEM: the pipeline's stages, or the cluster sum's partials if larger.
++    /// Tile<64, bm, bn, 1, wn, stages>::SMEM: the pipeline's stages, or the cluster sum's partials if larger.
 +    fn smem(c: QmmCfg) u32 {
-+        const stage = 16 * 128 + c.bn * 64 / 2 + 2 * (c.bn * 2) + 16 * 4;
-+        const partials = (c.bn / c.wn / 8) * 4 * (c.wn * 32) * 4;
++        const stage = c.bm * 128 + c.bn * 64 / 2 + 2 * (c.bn * 2) + c.bm * 4;
++        const partials = (c.bm / 16) * (c.bn / c.wn / 8) * 4 * (c.wn * 32) * 4;
 +        return @max(c.stages * stage, partials);
 +    }
 +};
++const qmm32: QmmCfg = .{ .bm = 32, .bn = 64, .wn = 4, .stages = 4 };
 +const qmm_cfgs = [_]QmmCfg{ .{ .bn = 64, .wn = 4, .stages = 4 }, .{ .bn = 128, .wn = 8, .stages = 4 }, .{ .bn = 128, .wn = 4, .stages = 6 } };
 +
 +/// glm_exl3d.cu's and experts.cu's instantiations (cuobjdump -symbols), and the prompt kernels' dynamic shared memory
@@ -8422,6 +8747,24 @@ index 0000000..793adf5
 +    return q4SplitK(n, kk);
 +}
 +
++/// qmm.matmul of 17 to 32 rows (a shared window): `qmm` on the 32-row tile, K slices as qmmDecode's (denseSplitK), so each
++/// row's bits are those of its lane's own window on a 16-row tile.
++pub fn qmmShared(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, xs: u64, q: Q4, out: u64, rows: usize, fp32: bool) !void {
++    if (rows <= 16 or rows > 32) return error.WindowTooWide;
++    if (x % 16 != 0 or x_stride % 8 != 0) return error.MisalignedInput;
++    const sk = denseSplitK(q.n, q.k);
++    const tiles = (q.n + qmm32.bn - 1) / qmm32.bn;
++    var a: cuda.Args = .{};
++    for ([_]u64{ x, xs, q.w, q.s, q.b, out, 0 }) |v| a.add(v);
++    for ([_]usize{ rows, q.n, q.k, sk, q.npad, x_stride, 1 }) |v| a.add(int(v));
++    try cuda.launch.launch(k.qmm32[@intFromBool(fp32)][@intFromBool(sk > 1)], .{
++        .grid = .{ .x = u(tiles), .y = 1, .z = u(sk) },
++        .block = .{ .x = qmm32.wn * 32 },
++        .shared = qmm32.smem(),
++        .cluster = if (sk > 1) .{ .x = 1, .y = 1, .z = u(sk) } else null,
++    }, s, &a);
++}
++
 +/// qmm.matmul of a 4-bit q for a decode window (shared.matmul -> `qmm` or, with dec_tile, `qmm_cfg`: v1.8's qmm_kernel):
 +/// x (rows <= 16, k) bf16, rows `x_stride` elements apart, with its group sums xs -> out (rows, n), fp32 with `f32`.
 +pub fn qmmDecode(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, xs: u64, q: Q4, out: u64, rows: usize, fp32: bool) !void {
@@ -8504,6 +8847,7 @@ index 0000000..793adf5
 +        try t.expectEqual(s[3], decCfg(s[0], s[1]));
 +    }
 +    try t.expectEqual(@as(u32, 17664), qmm_cfgs[0].smem()); // Tile<64, 16, 64, 1, 4, 4>
++    try t.expectEqual(@as(u32, 26112), qmm32.smem()); // Tile<64, 32, 64, 1, 4, 4>
 +    try t.expectEqual(@as(u32, 26880), qmm_cfgs[1].smem()); // Tile<64, 16, 128, 1, 8, 4>
 +    try t.expectEqual(@as(u32, 40320), qmm_cfgs[2].smem()); // Tile<64, 16, 128, 1, 4, 6>
 +}
@@ -9684,10 +10028,10 @@ index 0000000..3f4c536
 +}
 diff --git a/zig/src/families/glm/cuda/glm_native.zig b/zig/src/families/glm/cuda/glm_native.zig
 new file mode 100644
-index 0000000..72f5826
+index 0000000..a3337b2
 --- /dev/null
 +++ b/zig/src/families/glm/cuda/glm_native.zig
-@@ -0,0 +1,1022 @@
+@@ -0,0 +1,1134 @@
 +//! GLM-5.3-Flash on two CUDA ranks behind the native family interface (native/cuda.zig): this process is rank 0
 +//! and serves; rank 1 runs `tf-glm follow` on the other Spark. A stream a lane (each lane one sequence's caches and
 +//! DFlash2 context), the lanes' rounds taking turns; an idle lane keeps its caches' rows, so a later turn of its
@@ -10021,10 +10365,49 @@ index 0000000..72f5826
 +
 +    fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
 +        const g = of(p);
++        const ids = s.prompt();
++        var at = try g.admitPrompt(s);
++        const ln = g.laneOf(s).?;
++        errdefer ln.stream = null;
++        g.pass = ids;
++        defer {
++            g.pass = &.{};
++            g.pass_at = null;
++        }
++        var next: usize = 0; // the planned chunk starts: a resumed pass cuts where a fresh one does
++        while (at < ids.len) {
++            if (s.isCancelled()) return error.Cancelled;
++            const rows = nextCut(s, at, &next);
++            try g.n.chunk(at, rows);
++            try ln.live.appendSlice(g.gpa, ids[at..][0..rows]);
++            at += rows;
++            g.pass_at = @intCast(at);
++            if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |hk| hk.at(hk.ptr, s, @intCast(at));
++        }
++        try g.firstOf(s, ln);
++    }
++
++    /// The rows of the prompt chunk from `at`: to its next planned start (`next` walks s.chunks) or its end, at most a chunk.
++    fn nextCut(s: *const lanes.Stream, at: usize, next: *usize) usize {
++        while (next.* < s.chunks.len and s.chunks[next.*] <= at) next.* += 1;
++        const end: usize = if (next.* < s.chunks.len) s.chunks[next.*] else s.prompt().len;
++        return @min(end - at, fwd.Engine.prefill_rows);
++    }
++
++    /// The first token after the bound lane's prompt.
++    fn firstOf(g: *Glm, s: *lanes.Stream, ln: *Lane) !void {
++        const k = try candidateCount(s);
++        const first = try g.n.first(k);
++        var one: [1]u32 = .{first};
++        if (k > 0) try g.choose(s, .last, k, 1, s.prompt().len, &one);
++        ln.first = g.take(one[0]);
++    }
++
++    /// A prompt's lane (bound) and its begun state: a kept state of its prefix resumed, else empty; where its pass starts.
++    fn admitPrompt(g: *Glm, s: *lanes.Stream) !usize {
 +        const e = &g.n.e;
 +        const ids = s.prompt();
 +        if (ids.len == 0 or ids.len + s.max_new + max_rows > e.st.capacity) return error.PromptTooLong;
-+        const k = try candidateCount(s);
 +        s.cached = 0;
 +        // a kept state of this prompt's prefix resumes in a lane whose rows hold it, or in a free lane they are
 +        // copied to; without one the pass starts at 0 in the free lane used longest ago
@@ -10067,27 +10450,88 @@ index 0000000..72f5826
 +        ln.live.shrinkRetainingCapacity(@min(ln.live.items.len, at));
 +        try g.n.begin(ids, g.drafts and !g.dflash, snap, at);
 +        s.cached = @intCast(at);
-+        g.pass = ids;
++        return at;
++    }
++
++    /// multi_prefill (TF_GLM_MULTI_PREFILL): several prompts admitted together share prompt chunks. Each chunk round plans one
++    /// piece a prompt, its next cut exactly as its own pass would take it (nextCut), the fewest rows left first, while the
++    /// prompt buffers hold them (each piece at a multiple of 64 rows); a prompt that does not fit waits for the next round.
++    /// A round of one piece is a chunk of its own (Node.chunk). With the MTP head each prompt fills alone.
++    // ponytail: a failed admission fails the whole group (the host drops each); per-stream errors if groups grow large
++    fn prefillManyFn(p: *anyopaque, streams: []*lanes.Stream) anyerror!void {
++        const g = of(p);
++        if (streams.len < 2 or (g.drafts and !g.dflash)) {
++            for (streams) |s| try prefillFn(p, s);
++            return;
++        }
++        if (streams.len > max_lanes) return error.NoFreeLane;
++        var at: [max_lanes]usize = undefined;
++        var next: [max_lanes]usize = @splat(0);
++        var lane: [max_lanes]usize = undefined;
++        var admitted: usize = 0;
++        errdefer for (lane[0..admitted]) |l| {
++            g.lanes[l].stream = null;
++        };
++        for (streams, 0..) |s, i| {
++            at[i] = try g.admitPrompt(s);
++            lane[i] = g.n.e.lane;
++            admitted += 1;
++        }
 +        defer {
 +            g.pass = &.{};
 +            g.pass_at = null;
 +        }
-+        var next: usize = 0; // the planned chunk starts: a resumed pass cuts where a fresh one does
-+        while (at < ids.len) {
-+            if (s.isCancelled()) return error.Cancelled;
-+            while (next < s.chunks.len and s.chunks[next] <= at) next += 1;
-+            const end: usize = if (next < s.chunks.len) s.chunks[next] else ids.len;
-+            const rows = @min(end - at, fwd.Engine.prefill_rows);
-+            try g.n.chunk(at, rows);
-+            try ln.live.appendSlice(g.gpa, ids[at..][0..rows]);
-+            at += rows;
-+            g.pass_at = @intCast(at);
-+            if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |hk| hk.at(hk.ptr, s, @intCast(at));
++        while (true) {
++            var order: [max_lanes]usize = undefined;
++            var m: usize = 0;
++            for (streams, 0..) |s, i| if (at[i] < s.prompt().len and !s.isCancelled()) {
++                order[m] = i;
++                m += 1;
++            };
++            if (m == 0) break;
++            const left = struct {
++                fn less(ctx: struct { []*lanes.Stream, []const usize }, a: usize, b: usize) bool {
++                    return ctx[0][a].prompt().len - ctx[1][a] < ctx[0][b].prompt().len - ctx[1][b];
++                }
++            };
++            std.sort.insertion(usize, order[0..m], .{ streams, at[0..streams.len] }, left.less);
++            var items: [max_lanes][3]usize = undefined;
++            var picked: [max_lanes]usize = undefined;
++            var n: usize = 0;
++            var used: usize = 0;
++            for (order[0..m]) |i| {
++                var nx = next[i];
++                const rows = nextCut(streams[i], at[i], &nx);
++                const lo = std.mem.alignForward(usize, used, 64);
++                if (lo + rows > fwd.Engine.prefill_rows) continue;
++                next[i] = nx;
++                items[n] = .{ lane[i], at[i], rows };
++                picked[n] = i;
++                n += 1;
++                used = lo + rows;
++            }
++            if (n == 1) {
++                try g.n.bind(lane[picked[0]]);
++                try g.n.chunk(at[picked[0]], items[0][2]);
++            } else try g.n.chunkLanes(items[0..n]);
++            for (items[0..n], picked[0..n]) |it, i| {
++                const s = streams[i];
++                const ln = &g.lanes[lane[i]];
++                try ln.live.appendSlice(g.gpa, s.prompt()[at[i]..][0..it[2]]);
++                at[i] += it[2];
++                if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at[i])) != null) if (s.reuse.hook) |hk| {
++                    try g.n.bind(lane[i]); // snapSave keeps the bound lane's state
++                    g.pass = s.prompt();
++                    g.pass_at = @intCast(at[i]);
++                    hk.at(hk.ptr, s, @intCast(at[i]));
++                };
++            }
 +        }
-+        const first = try g.n.first(k);
-+        var one: [1]u32 = .{first};
-+        if (k > 0) try g.choose(s, .last, k, 1, ids.len, &one);
-+        ln.first = g.take(one[0]);
++        for (streams, 0..) |s, i| {
++            if (s.isCancelled()) continue; // the core releases it
++            try g.n.bind(lane[i]);
++            try g.firstOf(s, &g.lanes[lane[i]]);
++        }
 +    }
 +
 +    fn firstFn(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -10327,7 +10771,7 @@ index 0000000..72f5826
 +    }
 +
 +    fn backend(g: *Glm) be.Backend {
-+        g.vtable = .{ .prefill = prefillFn, .first = firstFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .tree = treeFn };
++        g.vtable = .{ .prefill = prefillFn, .first = firstFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .tree = treeFn, .prefill_many = prefillManyFn };
 +        return .{ .ptr = g, .vtable = &g.vtable };
 +    }
 +
@@ -10372,6 +10816,15 @@ index 0000000..72f5826
 +            g.shared[total - 1] = .{ .width = @intCast(total), .ms = best };
 +        }
 +        std.log.info("GLM shared window ms by rows (two lanes): 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}, {d} {d:.1}", .{ g.shared[1].ms, g.shared[3].ms, g.shared[7].ms, g.shared[15].ms, g.sharedRows(), g.shared[g.sharedRows() - 1].ms });
++    }
++
++    /// TF_GLM_SHARED_FLAT (default on; 0 off): every shared width costs as 2 rows, so the core keeps every draft in a
++    /// shared round, as v1.10 does (its multi-stream rounds take each stream's drafts with no depth policy): +1.7% at
++    /// four streams, the same replies.
++    fn flatten(g: *Glm) void {
++        if (std.c.getenv("TF_GLM_SHARED_FLAT")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return;
++        for (g.shared[1..g.sharedRows()]) |*c| c.ms = g.shared[1].ms;
++        std.log.info("GLM shared rounds keep every draft (TF_GLM_SHARED_FLAT; costs flat at {d:.1} ms)", .{g.shared[1].ms});
 +    }
 +
 +    /// A shared round's rows at most: fwd.Engine.shared_rows over the segmented kernels, else the lanes' own max_rows.
@@ -10612,7 +11065,10 @@ index 0000000..72f5826
 +pub fn grow(p: *anyopaque, total: u32) !u32 {
 +    const g = Glm.of(p);
 +    g.n_lanes = try g.n.grow(total);
-+    if (g.n_lanes > 1 and g.drafts) try g.measureShared();
++    if (g.n_lanes > 1 and g.drafts) {
++        try g.measureShared();
++        g.flatten();
++    }
 +    return @intCast(g.n_lanes);
 +}
 +
@@ -10712,10 +11168,10 @@ index 0000000..72f5826
 +}
 diff --git a/zig/src/families/glm/cuda/glm_node.zig b/zig/src/families/glm/cuda/glm_node.zig
 new file mode 100644
-index 0000000..4fc9cf6
+index 0000000..8a2b3d2
 --- /dev/null
 +++ b/zig/src/families/glm/cuda/glm_node.zig
-@@ -0,0 +1,481 @@
+@@ -0,0 +1,527 @@
 +//! One rank of the two-rank GLM engine and the commands that keep the ranks in step: rank 0 sends each command to
 +//! rank 1 over the TCP pair before running it, rank 1 runs the same commands in the same order. Every token the
 +//! ranks pick comes from the same all-gather, so they agree without sending results back.
@@ -10732,7 +11188,7 @@ index 0000000..4fc9cf6
 +
 +const Engine = fwd.Engine;
 +
-+pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16, dflash_blocks = 17, keep_lanes = 18 };
++pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16, dflash_blocks = 17, keep_lanes = 18, chunk_lanes = 19 };
 +
 +/// TF_GLM_DRAFTER_DIR: the DFlash2 draft model's snapshot folder (v1.8's DRAFTER=dflash2); unset: the MTP head drafts.
 +pub fn drafterDir() ?[]const u8 {
@@ -10759,7 +11215,7 @@ index 0000000..4fc9cf6
 +    k: kern.Kernels,
 +    e: Engine,
 +    words: std.ArrayList(u32) = .empty,
-+    prompt: std.ArrayList(u32) = .empty, // the prompt `begin` started, which `chunk` reads
++    prompts: [Engine.max_lanes]std.ArrayList(u32) = @splat(.empty), // each lane's begun prompt, which `chunk` and `chunkLanes` read
 +    mtp: bool = false,
 +    roce: ?*roce_mod.Roce = null,
 +    dflash: ?dflash.Drafter = null, // the bound lane's DFlash2 context (bind swaps it with `drafters`)
@@ -10775,7 +11231,7 @@ index 0000000..4fc9cf6
 +        n.gpa = gpa;
 +        n.rank = rank;
 +        n.words = .empty;
-+        n.prompt = .empty;
++        n.prompts = @splat(.empty);
 +        n.mtp = false;
 +        n.snaps = .empty;
 +        n.drafters = @splat(null);
@@ -10845,7 +11301,7 @@ index 0000000..4fc9cf6
 +        var it = n.snaps.valueIterator();
 +        while (it.next()) |b| b.free();
 +        n.snaps.deinit(n.gpa);
-+        n.prompt.deinit(n.gpa);
++        for (&n.prompts) |*pr| pr.deinit(n.gpa);
 +        if (n.dflash) |*dr| dr.deinit();
 +        for (&n.drafters) |*slot| if (slot.*) |*dr| dr.deinit();
 +        if (n.batch) |*b| b.deinit();
@@ -10890,8 +11346,9 @@ index 0000000..4fc9cf6
 +        try n.words.appendSlice(n.gpa, &.{ @intFromBool(mtp), snap, @intCast(at) });
 +        try n.words.appendSlice(n.gpa, prompt);
 +        try n.send(.begin, n.words.items);
-+        n.prompt.clearRetainingCapacity();
-+        try n.prompt.appendSlice(n.gpa, prompt);
++        const mine = &n.prompts[n.e.lane];
++        mine.clearRetainingCapacity();
++        try mine.appendSlice(n.gpa, prompt);
 +        n.mtp = mtp;
 +        if (snap == no_snapshot) {
 +            try n.e.reset();
@@ -10906,7 +11363,45 @@ index 0000000..4fc9cf6
 +    /// The begun prompt's rows at .. at + rows, at the state's position.
 +    pub fn chunk(n: *Node, at: usize, rows: usize) !void {
 +        try n.send(.chunk, &.{ @intCast(at), @intCast(rows) });
-+        try dec.prefillChunk(&n.e, n.prompt.items, at, rows, n.mtp, if (n.dflash) |*dr| dr else null);
++        try dec.prefillChunk(&n.e, n.prompts[n.e.lane].items, at, rows, n.mtp, if (n.dflash) |*dr| dr else null);
++    }
++
++    /// One prompt chunk over several begun lanes' next rows (multi_prefill.prefill_pieces; rank 0 sends it, both run it):
++    /// `items` (lane, at, rows), each piece at the next multiple of 64 rows of the prompt buffers; then per piece its taps
++    /// into its lane's DFlash2 context and its lane's commit. Not with the MTP head (its cache is not grouped).
++    pub fn chunkLanes(n: *Node, items: []const [3]usize) !void {
++        n.words.clearRetainingCapacity();
++        try n.words.append(n.gpa, @intCast(items.len));
++        for (items) |it| try n.words.appendSlice(n.gpa, &.{ @intCast(it[0]), @intCast(it[1]), @intCast(it[2]) });
++        try n.send(.chunk_lanes, n.words.items);
++        if (n.mtp or items.len > Engine.max_lanes) return error.BadChunk;
++        var pieces: [Engine.max_lanes]Engine.Piece = undefined;
++        var ids: [Engine.prefill_rows]u32 = undefined;
++        var at: usize = 0;
++        for (items, 0..) |it, i| {
++            const lane = it[0];
++            if (lane >= n.e.n_lanes) return error.NoSuchLane;
++            const prompt = n.prompts[lane].items;
++            if (it[2] == 0 or it[1] + it[2] > prompt.len or n.e.laneState(lane).pos != it[1]) return error.ChunkOutOfStep;
++            const lo = std.mem.alignForward(usize, at, 64);
++            if (lo + it[2] > ids.len) return error.BadChunk;
++            @memset(ids[at..lo], 0);
++            @memcpy(ids[lo..][0..it[2]], prompt[it[1]..][0..it[2]]);
++            pieces[i] = .{ .lane = lane, .rows = it[2], .lo = lo };
++            at = lo + it[2];
++        }
++        try n.e.prefillPieces(pieces[0..items.len], ids[0..at]);
++        for (pieces[0..items.len]) |pc| {
++            try n.bind(pc.lane);
++            if (n.dflash) |*dr| { // the piece's rows of the taps (the row0 offset dflashRun takes)
++                var b = n.e.pbuf;
++                for (&b.taps) |*t| if (t.* != 0) {
++                    t.* += pc.lo * n.e.w.cfg.hidden * 2;
++                };
++                try dr.addTaps(&n.e, &b, pc.rows);
++            }
++            try n.e.commitChunk(pc.rows);
++        }
 +    }
 +
 +    /// The first token after the prompt's last chunk. k 0: greedy, the token returned; else the last row's k
@@ -11188,6 +11683,13 @@ index 0000000..4fc9cf6
 +                    if (m > Engine.max_lanes) return error.TooManySegments;
 +                    for (0..m) |i| items[i] = .{ .lane = w[1 + 3 * i], .rows = w[2 + 3 * i], .keep = w[3 + 3 * i] };
 +                    try n.keepLanes(items[0..m]);
++                },
++                .chunk_lanes => {
++                    const m = w[0];
++                    var items: [Engine.max_lanes][3]usize = undefined;
++                    if (m > Engine.max_lanes) return error.BadChunk;
++                    for (0..m) |i| items[i] = .{ w[1 + 3 * i], w[2 + 3 * i], w[3 + 3 * i] };
++                    try n.chunkLanes(items[0..m]);
 +                },
 +                .bind => try n.bind(w[0]),
 +                .grow => _ = try n.grow(w[0]),

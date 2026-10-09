@@ -545,19 +545,19 @@ dropped before each run, prompts made unique so neither engine resumes a kept st
 
 | Four requests at once, aggregate | v1.10, `PARALLEL=4` | native, `PARALLEL=4` (262,144) |
 |---|---|---|
-| Four different prompts, 256-token replies, greedy | 88.2 tokens/s | 81.2 tokens/s |
-| Four different prompts, 1,024-token replies, greedy / sampled | 101.7 / 101.4 tokens/s | 92.4 tokens/s (greedy) |
-| One code prompt four times, sampled | 101.1 tokens/s | 89.0-92.4 tokens/s |
+| Four different prompts, 256-token replies, greedy / sampled | 88.2 / 88.3 tokens/s | 86.1 / 85.8 tokens/s |
+| Four different prompts, 1,024-token replies, greedy / sampled | 101.7 / 101.4 tokens/s | 97.1 / 97.3 tokens/s |
 
 Replies are token for token v1.10's on its reference sets (116 of 116, DFlash2 and copy drafts, RoCE), and four at
 once equal the same requests one at a time and drafted equal serial (`tools/bench_concurrent.py --alone --serial`,
-every cell). Shared windows take up to 32 rows across the requests (v1.10's `TF_GLM_MULTI_WINDOW` default), each
-request's own part up to 16. Where the rest goes, four different prompts with 1,024-token replies, averaged over
-rounds: native 118 ms a round for 13.2 rows (forward 107, DFlash2 8.6 of which block passes 6.0), v1.10 108 ms for
-12.6 rows (verify 101, DFlash2 4.5). A shared window costs more than one request's window of the same rows (8 rows:
-75.8 ms over two requests, 64.8 alone); v1.10's does too, by less. Short replies add one more difference: v1.10
-prefills prompts that arrive together in one pass, the native engine one after another (four short prompts: last
-first token 0.44-0.67 s, v1.10 0.15-0.24 s).
+every cell), and so do prompts of 41 to 5,649 tokens sent together (past the 2,051-token dense limit too). As
+v1.10: shared windows take up to 32 rows across the requests (`TF_GLM_MULTI_WINDOW`), each request's own part up to
+16, with the 4-bit matmuls on a 32-row tile past 16 rows; a shared round keeps every draft (no depth policy;
+`TF_GLM_SHARED_FLAT=0` lets the lanes core trim them); prompts that arrive together prefill in shared prompt chunks.
+What is left of the gap, four different prompts with 1,024-token replies: a native round of ~17 rows takes 131 ms
+(forward 121, DFlash2 7.5), v1.10's of 18 rows 131 ms (verify 124, DFlash2 4.5), and v1.10 accepts a little more a
+round. Prompts that prefill together all wait for the longest (12-, 300-, 900- and 2,600-word prompts: first tokens
+0.16 s and then 4.8 s for the other three; v1.10 interleaves prompt chunks with decoding, `TF_GLM_FILL_ROWS`).
 
 **What it does not have yet**, against v1.8 (measured on two Sparks, `Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit`):
 
