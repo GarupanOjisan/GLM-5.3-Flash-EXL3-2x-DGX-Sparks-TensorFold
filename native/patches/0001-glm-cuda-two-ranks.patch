@@ -4957,10 +4957,10 @@ index 0000000..4612953
 +}
 diff --git a/zig/src/families/glm/cuda/glm_dflash.zig b/zig/src/families/glm/cuda/glm_dflash.zig
 new file mode 100644
-index 0000000..6016bb7
+index 0000000..9621dbe
 --- /dev/null
 +++ b/zig/src/families/glm/cuda/glm_dflash.zig
-@@ -0,0 +1,933 @@
+@@ -0,0 +1,954 @@
 +//! DFlash2 drafts for GLM-5.3-Flash on two CUDA ranks (v1.8 glm5_next/cuda/dflash2.py, the single-stream `Drafter`): a five
 +//! layer block model with two-tap dynamic convolutions and sliding-window attention reads the means of the target's streams
 +//! at five layers (the "taps" of every committed row) and, for [pending token, mask x (block - 1)], proposes candidates for
@@ -5817,11 +5817,7 @@ index 0000000..6016bb7
 +        const S = ds.len;
 +        if (S == 0 or S > b.lanes or pend.len != S) return error.BadDraftBatch;
 +        const n = dr.block;
-+        const nb = n - 1;
-+        const D = dr.d;
-+        const k = dr.top_k;
 +        const R = S * n;
-+        const M = S * nb;
 +        var ids: [8 * max_block]i32 = undefined;
 +        for (0..S) |s| {
 +            @memset(ids[s * n ..][0..n], @intCast(dr.mask_id));
@@ -5837,10 +5833,28 @@ index 0000000..6016bb7
 +            }
 +            try e.upload(b.slots, std.mem.sliceAsBytes(slot[0..S]));
 +        }
++        // with the pool every address below is fixed for a lane count (the positions come from `meta`): one graph each
++        if (b.pool != null and e.use_graphs) {
++            try e.replay(.{ .lane = 0, .head = .dbatch, .rows = @intCast(S), .cur = 0, .np = 0 }, pass, .{ b, e, ds });
++        } else try b.pass(e, ds);
++        if (!read) return;
++        try b.readBack(e, ds);
++    }
++
++    /// Batch.blocks' device work, from the embedded block rows to the gathered candidates and the selector rows.
++    fn pass(b: *Batch, e: *Engine, ds: []const *Drafter) !void {
++        const dr = b.dr;
++        const S = ds.len;
++        const n = dr.block;
++        const nb = n - 1;
++        const D = dr.d;
++        const k = dr.top_k;
++        const R = S * n;
++        const M = S * nb;
 +        try e.t.embed(b.ids, b.w.embed, b.x, R, D, 1);
 +        for (ds, 0..) |dft, s| {
 +            var a: cuda.Args = .{};
-+            a.add(dft.pos_dev);
++            a.add(if (b.pool != null) b.meta + 8 * s else dft.pos_dev);
 +            a.add(dr.inv_freq);
 +            a.add(int(n));
 +            a.add(int(dr.hd / 2));
@@ -5872,7 +5886,14 @@ index 0000000..6016bb7
 +        p.add(int(dr.sel_rank));
 +        p.add(int(D));
 +        try cuda.launch.launch(e.k.df_proj, .{ .grid = .{ .x = @intCast((dr.sel_rank + 7) / 8), .y = @intCast(M) }, .block = .{ .x = 256 } }, e.s, &p);
-+        if (!read) return;
++    }
++
++    /// Rank 0: each drafter's merged candidates and selector rows from the last pass.
++    fn readBack(b: *Batch, e: *Engine, ds: []const *Drafter) !void {
++        const dr = b.dr;
++        const nb = dr.block - 1;
++        const k = dr.top_k;
++        const M = ds.len * nb;
 +        // v1.10 patch 0092 as Drafter.block: a bad id is a copy read early; copy again once the device is idle
 +        for (0..2) |attempt| {
 +            try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(b.cand_host.ptr, b.cand_all, wt.world * M * 2 * k * 4, e.s.handle), "cuMemcpyDtoHAsync");
@@ -5889,14 +5910,14 @@ index 0000000..6016bb7
 +            }
 +            if (good) return;
 +            if (attempt == 1) return error.BadDrafterCandidates;
-+            std.log.warn("drafter: a candidate id outside the vocabulary ({d} lanes); copying the rows again once the device is idle", .{S});
++            std.log.warn("drafter: a candidate id outside the vocabulary ({d} lanes); copying the rows again once the device is idle", .{ds.len});
 +            try e.d.check(e.d.api.cuCtxSynchronize(), "cuCtxSynchronize");
 +        }
 +    }
 +};
 diff --git a/zig/src/families/glm/cuda/glm_forward.zig b/zig/src/families/glm/cuda/glm_forward.zig
 new file mode 100644
-index 0000000..9bb4aae
+index 0000000..44800f6
 --- /dev/null
 +++ b/zig/src/families/glm/cuda/glm_forward.zig
 @@ -0,0 +1,2124 @@
@@ -6158,7 +6179,7 @@ index 0000000..9bb4aae
 +    cur: u8,
 +    np: u32,
 +
-+    pub const Head = enum(u8) { main, mtp, dtaps, dblock, seg }; // DFlash2's context update and block pass (glm_dflash.zig)
++    pub const Head = enum(u8) { main, mtp, dtaps, dblock, seg, dbatch }; // DFlash2's context update, block pass and the lanes' batched block pass (glm_dflash.zig)
 +};
 +const GraphEntry = struct { key: GraphKey, exec: cuda.graph.Exec };
 +
