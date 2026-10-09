@@ -545,8 +545,14 @@ dropped before each run, prompts made unique so neither engine resumes a kept st
 
 | Four requests at once, aggregate | v1.10, `PARALLEL=4` | native, `PARALLEL=4` (262,144) |
 |---|---|---|
-| Four different prompts, 256-token replies, greedy / sampled | 89.4 / 89.3 tokens/s | 86.3 / 85.7 tokens/s |
-| Four different prompts, 1,024-token replies, greedy / sampled | 101.4 / 101.3 tokens/s | 97.7 / 97.5 tokens/s |
+| Four different prompts, 256-token replies, greedy / sampled | 89.3 / 87.8 tokens/s | 87.5 / 87.5 tokens/s |
+| Four different prompts, 1,024-token replies, greedy / sampled | 101.5 / 101.1 tokens/s | 99.7 / 99.1 tokens/s |
+
+While all four decode together the native engine is the faster (110.4 against 108.8 tokens/s): a round of 17 rows
+takes 128 ms on both and accepts the same tokens a row (0.82-0.86), and an 8-row window of one request costs 63 ms
+against v1.10's 67. What is left is outside that stretch: the aggregate counts from the first request's first token,
+and v1.10 usually takes all four prompts in one prefill where the native server opens the first one alone and the
+other three just after.
 
 Replies are token for token v1.10's on its reference sets (116 of 116, DFlash2 and copy drafts, RoCE), and four at
 once equal the same requests one at a time and drafted equal serial (`tools/bench_concurrent.py --alone --serial`,
@@ -557,9 +563,7 @@ v1.10: shared windows take up to 32 rows across the requests (`TF_GLM_MULTI_WIND
 a new prompt's 2,048-row chunks alternate with the other requests' decode rounds, and each request opens as soon as
 its own prompt is in (12-, 300-, 900- and 2,600-word prompts together: first tokens 0.16 / 0.74 / 1.9 / 5.2 s, the
 shortest reply's longest pause 1.2 s; v1.10 slices chunks by layers, `FILL_BUDGET_MS`); DFlash2's block pass and taps
-run once for all requests (one graph each). What is left of the gap: before the last three changes a native round of
-~17 rows took 131 ms (forward 121, DFlash2 7.5), v1.10's of 18 rows 131 ms (verify 124, DFlash2 4.5), and v1.10
-accepts a little more a round.
+run once for all requests (one graph each), and so does every request's pick (one launch, one all-gather).
 
 **What it does not have yet**, against v1.8 (measured on two Sparks, `Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit`):
 

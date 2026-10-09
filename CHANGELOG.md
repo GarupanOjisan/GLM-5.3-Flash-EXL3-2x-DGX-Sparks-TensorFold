@@ -38,6 +38,12 @@ Every change to this recipe, newest first. Each release names the image it serve
   DFlash2's layer matmuls on the 32-row tile and its taps for every lane in one graph. Same session as v1.10: four
   different prompts 86.3 / 85.7 tokens/s at 256-token replies greedy / sampled (v1.10 89.4 / 89.3), 97.7 / 97.5 at
   1,024 (v1.10 101.4 / 101.3).
+- **One pick for all requests.** A shared round picks every request's rows in one launch and one all-gather (was one
+  per request, 1.7 ms a round against v1.10's 0.5), and the startup timings use v1.10's distinct token ids (sequential
+  ids had made the one-request windows look 15% cheaper than shared ones; an 8-row window is 63 ms either way). Same
+  session as v1.10: 87.5 / 87.5 tokens/s at 256-token replies (v1.10 89.3 / 87.8), 99.7 / 99.1 at 1,024 (v1.10 101.5 /
+  101.1), 116 of 116 on v1.10's references. With all four decoding the native engine is the faster (110.4 against
+  108.8); the rest is when the four prompts open.
 
 ## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
 
