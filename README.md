@@ -484,7 +484,9 @@ TensorFold 1.0 replaced the Python engine with a Zig binary, and 1.0.2 serves GL
 TensorFold 1.0.2 (commit `f8fe17d`): the EXL3 checkpoint's weights, v1.8's GLM kernels as CUDA C (EXL3 experts,
 KDA chunked prefill, hc, L2 prefetch, 4-bit dense matmuls) and its Triton kernels compiled ahead of time
 (`native/aot/sm121`), the dense projections quantized to 4 bits at load and an FP8 head as v1.8's `TF_GLM_DENSE=q4`,
-an FP8 attention cache (`TF_GLM_KV=fp8`), NCCL between the Sparks, MTP drafts and sampling, served by
+an FP8 attention cache (`TF_GLM_KV=fp8`), v1.10's speed patches (long-context selection, the nucleus union rule, the
+prefill's hyper-connections split between the ranks), RoCE all-gathers with NCCL beside them, DFlash2, copy and MTP
+drafts, and several requests decoding together in one verify window (v1.10's segment kernels), served by
 `tensorfold-native serve` with rank 1 following over a TCP control channel.
 
 ```bash
@@ -494,7 +496,9 @@ an FP8 attention cache (`TF_GLM_KV=fp8`), NCCL between the Sparks, MTP drafts an
 
 `start-native.sh` reads the same settings (`scripts/config.sh`, `scripts/local.sh`): `MODEL_ID`, `PORT`, `CONTEXT`,
 `MAX_TOKENS`, `THINKING`, `MEMORY_RESERVE_GIB`, `WORKER`, the RoCE links, `DRAFTER` (`dflash2`, the default, or
-`mtp`), `COPY`, `COPY_MAX`, `DRAFT_POLICY`, `KV`, `DENSE` and `KDA_CHUNKED`. It ignores `PARALLEL` and `VISION`.
+`mtp`), `COPY`, `COPY_MAX`, `DRAFT_POLICY`, `KV`, `DENSE`, `KDA_CHUNKED` and `PARALLEL`. It ignores `VISION`.
+With `PARALLEL` above 1 and no `CONTEXT` set, the window is 262,144 tokens: each request gets a whole window of its
+own (no shared pool yet), and four at 1,048,576 need 51.3 GiB a Spark where 16.7 GiB is left after the weights.
 
 **Drafts.** As v1.8: copy drafts from the prompt first (up to 15, windows up to 16 rows), else DFlash2's chain (up to
 7; the MTP head is not loaded, as v1.8's `TF_GLM_MTP=auto`), or with `DRAFTER=mtp` the checkpoint's MTP head. One
@@ -531,11 +535,28 @@ tokens: 21.6 s, then 16.5 s after `sysctl vm.drop_caches=3`; served, 361 tokens/
 and without it the script warns and starts anyway. Host swapping, the GPU clock, proactive compaction and physical
 memory fragmentation alone were ruled out.
 
+**Against v1.10** (this recipe's `./start.sh` at its defaults: DFlash2, copy drafts, RoCE), same session, page cache
+dropped before each run, prompts made unique so neither engine resumes a kept state:
+
+| | v1.10, `PARALLEL=1` | native, one request |
+|---|---|---|
+| Prefill, 8,192 / 32,768 / 123,312 tokens | 1,804 / 1,894 / 1,822 tokens/s | 1,791-1,800 / 1,838-1,854 / 1,763-1,776 tokens/s |
+| Decode: code edit, quoted passage, prose, code | 105 / 141 / 47 / 89 tokens/s | 104 / 136-137 / 45-46 / 87-88 tokens/s |
+
+| Four requests at once, aggregate | v1.10, `PARALLEL=4` | native, `PARALLEL=4` (262,144) |
+|---|---|---|
+| Four different prompts, greedy / sampled | 88.2 / 88.3 tokens/s | 80.7 / 80.7 tokens/s |
+| One code prompt four times, sampled | 101.1 tokens/s | 89.0-92.4 tokens/s |
+
+Replies are token for token v1.10's on its reference sets (116 of 116, DFlash2 and copy drafts, RoCE), and four at
+once equal the same requests one at a time and drafted equal serial (`tools/bench_concurrent.py --alone --serial`,
+every cell). A native round of four is about 110 ms: the shared window's forward 72-94 ms for ~11 rows, DFlash2 9 ms.
+
 **What it does not have yet**, against v1.8 (measured on two Sparks, `Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit`):
 
 | | Python engine (`./start.sh`) | native (`./start-native.sh`) |
 |---|---|---|
-| Requests at once | 4 (up to 8) | 1 |
+| Requests at once | 4 (up to 8), one shared pool | 4 (`PARALLEL`), a whole window each (262,144 tokens at 4) |
 | Prompt states kept between turns | yes, per conversation | yes, for the conversation last served (see below) |
 | Vision, structured outputs | yes | no |
 

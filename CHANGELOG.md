@@ -17,6 +17,14 @@ Every change to this recipe, newest first. Each release names the image it serve
   served (a 35k-token system prompt's later requests: 24 s -> 0.4 s). Drafts as v1.8: copy drafts (`COPY`, windows
   up to 16 rows) and DFlash2 (`DRAFTER=dflash2`, the default) or the MTP head; with DFlash2 and copies, the same
   replies as v1.8 at 93-103% of its speed, one request at a time. No vision or structured outputs yet.
+- **v1.10's speed patches and concurrent requests in the native engine.** The patch now carries v1.10's long-context
+  selection (0085, 0086), the nucleus union rule, DFlash2's candidate check (0092), RoCE all-gathers (0006, NCCL for
+  larger ones), the prefill's hyper-connections split between the ranks (0010, 0033), and `PARALLEL` requests decoding
+  together in one verify window with v1.10's segment kernels (KDA, DSA, DFlash2). `native/aot/sm121` grows to 458
+  specializations. Against v1.10 at its defaults on the same Sparks: one request prefills at 97-100% and decodes at
+  97-99% of its speed, token for token its replies (116 of 116); four different prompts at once, 80.7 tokens/s
+  aggregate (v1.10 88.2), each reply equal to the same request alone. `start-native.sh` passes `PARALLEL` (default 4)
+  and then defaults to a 262,144-token window: each request gets a window of its own, and four at 1,048,576 do not fit.
 
 ## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
 

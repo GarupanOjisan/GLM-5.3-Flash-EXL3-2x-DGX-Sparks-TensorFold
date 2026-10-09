@@ -2,11 +2,13 @@
 # Serve GLM-5.3-Flash with TensorFold 1.0.2's native engine (Zig, no Python) on two DGX Sparks: rank 1 follows on the
 # worker (tf-glm follow), rank 0 here serves the OpenAI-compatible API (tensorfold-native serve). Same container name,
 # port, model and link settings as ./start.sh, so ./stop.sh stops either; ./start.sh brings the Python engine back.
-# What it does not have yet (README "Native engine"): one request at a time, prompt states kept for the last
-# conversation only, no vision, no structured outputs. DRAFTER=dflash2 (the default) or mtp, COPY as ./start.sh.
+# What it does not have yet (README "Native engine"): no vision, no structured outputs. PARALLEL requests decode
+# together (default 4 with DRAFTER=dflash2, as ./start.sh); CONTEXT defaults to 262144 then (four lanes' caches fit),
+# 1048576 at PARALLEL=1. DRAFTER=dflash2 (the default) or mtp, COPY as ./start.sh.
 # Usage: ./start-native.sh [start|restart]     Env: as ./start.sh (scripts/config.sh), NATIVE_IMAGE, NATIVE_PORT_RANKS
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
+_ctx_env="${CONTEXT:-}"
 source ./scripts/config.sh
 source ./scripts/nodes.sh
 
@@ -14,7 +16,9 @@ MODE="${1:-start}"
 [[ "$MODE" == start || "$MODE" == restart ]] || die "usage: ./start-native.sh [start|restart]"
 (( TP == 2 )) || die "the native engine runs on two Sparks (TP=2), not $TP"
 need_workers
-(( PARALLEL == 1 )) || log "PARALLEL=$PARALLEL: the native engine serves one request at a time"
+# config.sh's 1M window is for v1.10's shared pool; the native engine gives each lane a whole window (four lanes at
+# 1048576 need 51.3 GiB a rank, 16.7 GiB is left after the weights), so with several lanes the default is 262144.
+[[ -z "$_ctx_env" ]] && (( PARALLEL > 1 )) && CONTEXT=262144
 [[ "$VISION" == 0 ]] || log "VISION=$VISION: the native engine has no vision yet; images are refused"
 RANK_PORT="${NATIVE_PORT_RANKS:-29660}"
 
@@ -74,7 +78,7 @@ for a in "${RUN_ARGS[@]}" "${ENV_ARGS[@]}" $(rank_nccl_env 1) -v "$WORKER_MOUNT"
 done
 worker 1 "$remote" >/dev/null || die "could not start rank 1 on $WORKER"
 rank0=(tensorfold-native serve "$MODEL_ARG" --host "$HOST" --port "$PORT" --name "$SERVED_NAME" --context "$CONTEXT"
-       --max-tokens "$MAX_TOKENS" --backend cuda "${think[@]}")
+       --max-tokens "$MAX_TOKENS" --top-k 20 --parallel "$PARALLEL" --backend cuda "${think[@]}")  # top_k 20: v1.10's default draw
 log "Rank 0 here: ${rank0[*]}"
 docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}" $(rank_nccl_env 0) \
   -v "$HF_CACHE":/root/.cache/huggingface --entrypoint "${rank0[0]}" "$NATIVE_IMAGE" "${rank0[@]:1}" >/dev/null
