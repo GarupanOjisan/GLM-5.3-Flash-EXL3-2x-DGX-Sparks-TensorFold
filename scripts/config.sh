@@ -311,6 +311,12 @@ _extra=$(awk -v p="$PARALLEL" -v w="${TF_GLM_MULTI_WINDOW:-32}" 'BEGIN { e = 0; 
   if (w > 32) e += 0.04 * (w - 32); printf "%.1f", e }')
 MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-$(awk -v e="$_extra" 'BEGIN { printf "%.1f", 14.5 + e }')}"
 export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
+# TensorFold reads MemAvailable once, at start, to size the shared pool. Pages freed in bulk just before (the image copy in
+# prepare.sh, a server that has just stopped) sit on the kernel's per-CPU free lists for 1-2 minutes, outside
+# MemAvailable: a first start of a new image got 89.5 GiB "within" and 2 kept prompt states, the second start of the
+# same image 95 GiB and all 32. start.sh waits (up to MEMORY_SETTLE_TIMEOUT seconds, 0 = not at all) until they are
+# back on every Spark; nothing to wait for costs nothing.
+MEMORY_SETTLE_TIMEOUT="${MEMORY_SETTLE_TIMEOUT:-180}"
 # With more Sparks each holds fewer weights, so the pool can take more (the per-token KV cost is the same on every
 # rank: the latent cache is replicated). TP=3: 32 GiB leaves rank 0, the busiest, ~5 GiB under a 1M-token prompt
 # (at 27: 10.6 GiB lowest on rank 0, pool 5,257,216 tokens; at 32: 5,959,680).
