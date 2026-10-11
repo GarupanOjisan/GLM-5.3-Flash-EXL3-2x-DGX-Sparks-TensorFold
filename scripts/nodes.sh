@@ -104,6 +104,8 @@ settle_memory_all() {
   local -a pids=()
   (( max > 0 )) || return 0
   dir=$(mktemp -d)
+  : > "$dir/0"
+  for i in $(worker_ids); do [[ -n "${WORKER_DOWN[$i]:-}" ]] || : > "$dir/$i"; done    # exist before the jobs write
   settle_memory "$max" > "$dir/0" 2>/dev/null &
   pids+=($!)
   for i in $(worker_ids); do
@@ -114,7 +116,7 @@ settle_memory_all() {
   # each node answers within a second or two: either "waiting" or the result, which means it had nothing to wait for
   for s in $(seq 1 25); do
     first=1
-    for i in 0 $(worker_ids); do [[ -e "$dir/$i" ]] && { [[ -s "$dir/$i" ]] || first=0; }; done
+    for i in "$dir"/*; do [[ -s "$i" ]] || first=0; done
     (( first )) && break
     sleep 0.2
   done
