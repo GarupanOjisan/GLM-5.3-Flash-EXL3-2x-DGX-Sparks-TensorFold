@@ -5,6 +5,21 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **The first start of a new image no longer gets a smaller pool** (`MEMORY_SETTLE_TIMEOUT`, scripts only, no patch).
+  TensorFold budgets each rank from `MemAvailable` at start; the first start of an image the worker lacked (the
+  `docker save` / `docker load` copy in `prepare.sh`) read 89.5 GiB on rank 0 and 88.2 on rank 1 against 94-95 for the
+  second start of the same image, and kept 2 prompt states, not 32. Measured with 1 s samples of `/proc/meminfo` and
+  `/proc/zoneinfo` on both Sparks: the copy frees ~24 GiB of page cache in one go, and the kernel parks 8.5 GiB of it
+  (head) and ~9 GiB (worker) on the per-CPU free lists, which count in neither `MemFree` nor `MemAvailable`
+  (`kpageflags`: refcount-0 pages in no free list; `zoneinfo`: `pagesets` `count:` 8.56 GiB). They come back at
+  ~0.1 GiB/s and are gone after 1-2 minutes, while the engine reads `MemAvailable` ~15 s after the copy ends. Not
+  dockerd or containerd (RSS flat at ~130 MB), not dirty pages (0.02 GiB by then), not the verify container, and not
+  kernel compilation (the kernels are cached per image). The same loss follows any bulk free, a stopped server among
+  them. `start.sh` now waits before its memory check, on both Sparks at once, until the parked pages are back or stop
+  coming back (up to `MEMORY_SETTLE_TIMEOUT` s, default 180; `0` skips it), and says how long it waited; with nothing
+  parked it costs about a second. First start of a new image, TP=2: rank 0 "within" 89.47 -> 94.63 GiB, rank 1 88.24 ->
+  95.27, all 32 prompt states kept; the wait was 78 s here and 98 s on the worker (a second new image: 94.70 / 95.06,
+  waits 86 s / 105 s). A second start of the same image waits ~1 s and gets 94.8 / 95.5, as without the wait.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at

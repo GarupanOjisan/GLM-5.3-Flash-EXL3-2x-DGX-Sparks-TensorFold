@@ -222,7 +222,8 @@ By default only data URLs are accepted; `VISION_URLS=1` also lets the server fet
    model, drafter, revision, image or worker).
 2. **Checks:** the arguments (TensorFold's own parser), the link, the previous server (stopped on `restart`, or when
    only one rank is up; a stopped container left from an earlier run is removed, its log saved first), the port, free memory (a warning
-   below ~110 GiB on either Spark).
+   below ~110 GiB on either Spark, read after waiting, if needed, for memory freed in bulk a moment ago to come back:
+   see below).
 3. **Launch:** rank 1 on the worker over ssh, then rank 0 and the API here, with the settings from `scripts/config.sh`.
 4. **Loading:** rank 0's log as it comes, and every 15 s the elapsed time and how much of the startup estimate is on
    each Spark's GPU; if a rank stops, both ranks' last log lines and why.
@@ -282,6 +283,17 @@ moving caches instead, patch `0074`); `/health` shows `pool_tokens`, `pool_free_
 TensorFold's budget on each Spark is `MemAvailable` at start minus a host reserve (`MEMORY_RESERVE_GIB`, 14.5 GiB here;
 TensorFold's own default is a tenth of RAM). The server uses about 10 GiB beyond its own estimate at its peak, so the
 reserve also sets the lowest free memory.
+
+TensorFold reads `MemAvailable` once, when it starts, so the start must not follow a bulk free too closely. The
+image copy in `prepare.sh` (`docker save` on the head, `docker load` on the worker) and a server that has just
+stopped free tens of GiB at once, and the kernel parks 5-9 GiB of it on its per-CPU free lists (the `count:` lines
+under `pagesets` in `/proc/zoneinfo`), in neither `MemFree` nor `MemAvailable`; it comes back at ~0.1 GiB/s over the
+next 1-2 minutes. A first start of a new image used to land in that window: 89.5 GiB budgeted on rank 0 and 88.2 on
+rank 1 where the second start got 94-95, which cut the kept prompt states from 32 to 2 and shrank the pool. `start.sh`
+now waits, on both Sparks at once, until that memory is back (up to `MEMORY_SETTLE_TIMEOUT` seconds, default 180;
+`0` skips the wait), says how long it waited, and costs nothing when there is nothing to wait for. As root it can be
+had at once: `echo 1000 | sudo tee /proc/sys/vm/percpu_pagelist_high_fraction; echo 0 | sudo tee /proc/sys/vm/percpu_pagelist_high_fraction`
+returns the parked pages in about two seconds (the recipe does not do this by itself).
 The GB10 firmware also keeps about 2 GiB for a screen, which a headless Spark never uses and `MemAvailable` never
 counts. With `PARALLEL` above 1, `DISPLAY_KV_MIB=1792` (patch 0072) adds that much of it to the pool on every rank, on
 top of `KV_POOL_GIB`: the first DSA layers' latent planes sit in a span of ordinary memory with the reservation mapped
@@ -500,6 +512,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `KV` | `fp8` | `fp8` or `bf16` (exact, shorter window) DSA latent cache and indexer keys |
 | `WORKER_WEIGHTS` | `copy` | `copy`: the worker keeps its own copy of the weights; `nfs`: it reads the head's over NFS ([Worker weights over NFS](#worker-weights-over-nfs)); with `NFS_PATH`, `NFS_SERVER`, `NFS_VOLUME` |
 | `KV_POOL_GIB` / `MEMORY_RESERVE_GIB` | `12.5` (`32` at `TP=3`) / `14.5`, plus ~0.95 a request past 4 and ~0.04 a window row past 32 (`19.6` at 8 requests and 64 rows) | the shared pool beyond the window (kept prompts, more long conversations at once) grows into what is free at start minus the reserve, up to `KV_POOL_GIB` GiB a Spark; the reserve sets the lowest free memory on the head (~4.5-5 GiB under a 1M-token prompt); it grows with `PARALLEL` because more requests at once take more than the startup estimate counts; raise it when other work shares the Sparks |
+| `MEMORY_SETTLE_TIMEOUT` | `180` | seconds `start.sh` waits, before it reads each Spark's free memory, for pages freed in bulk (the image copy, a server just stopped) to come back from the kernel's per-CPU free lists; `0` does not wait ([memory budget](#kv-pool-and-memory)) |
 | `DISPLAY_KV_MIB` | `0` (off) | MiB of the GPU's display reservation added to the shared pool on every rank (patch 0072, `PARALLEL` above 1; a multiple of 16 up to 2032, 1792 measured): pool tokens without host memory, on top of `KV_POOL_GIB`; needs `/dev/dri/card0`; headless Sparks only (refused while a display is connected) |
 | `DISPLAY_KV_BACKEND` | `drm` | where `DISPLAY_KV_MIB`'s reservation comes from: `drm` (a DRM dumb buffer on `card0`, `nvidia_drm` with `modeset=1`) or `dispram` (kindling spark-os's `dispramd`; `start.sh` mounts its socket and client into every rank) (patch 0087) |
 | `DENSE` | `q4` | the checkpoint's BF16 weights (attention, shared experts, dense layers, head): `q4` (4-bit groups of 64, the head in FP8, kv_b in BF16), `fp8` or `bf16`. **Non-English prompts:** `q4` can lose the end of turn on short French coding prompts (replies run to `max_tokens`, issue #18); `fp8` keeps it, at ~10% decode speed |
