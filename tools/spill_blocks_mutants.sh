@@ -110,6 +110,14 @@ run settle-before-slots $B "        evs = getattr(self, \"read_events\", None)" 
 run write-event-per-block $B "                    ev = self.slot_events[slot] if self.slot_events else None   # (made at start: a GPU's only)\n                    if ev is not None:\n                        ev.record()\n" "                    ev = None\n                    if self.dev_slot.device.type == \"cuda\":\n                        ev = torch.cuda.Event()\n                        ev.record()\n"
 # LOADED on a rank with more blocks left than read slots: the wait frees the slots its copies hold
 run hang-no-recycle-in-wait $B "                    if self.read_events:                    # the slots this step's own copies used: back to the reader,\n                        self._recycle(wait=True)            # or it waits for one and block i is never read\n" ""
+# the read-ahead: 16 blocks by default (ten in the preallocated buffers), those buffers kept, the rest in power-of-two pieces
+run read-ahead-default-9 $B "READ_BLOCKS = 16               #" "READ_BLOCKS = 9                #"
+run read-ahead-default-32 $B "READ_BLOCKS = 16               #" "READ_BLOCKS = 32               #"
+run read-ahead-default-17 $B "READ_BLOCKS = 16               #" "READ_BLOCKS = 17               #"
+run read-ahead-replaces-preallocate $B "    bufs = _sp._PINNED.setdefault(\"read\", [])\n    want = read_blocks() * per - sum(b.numel() for b in bufs)\n" "    bufs = _sp._PINNED[\"read\"] = []\n    want = read_blocks() * per\n"
+run read-ahead-charges-preallocate $B "    want = read_blocks() * per - sum(b.numel() for b in bufs)\n" "    want = read_blocks() * per\n"
+run read-ahead-one-piece $B "        size = 1 << (max(min(want, _sp.CHUNK), per) - 1).bit_length()\n" "        size = max(want, per)\n"
+run read-ahead-per-slot $B "        size = 1 << (max(min(want, _sp.CHUNK), per) - 1).bit_length()\n" "        size = per\n"
 rm -f "$OUT"
 echo "exit $bad"
 exit $bad

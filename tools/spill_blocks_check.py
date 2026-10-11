@@ -24,9 +24,14 @@ rows), with a stand-in small state, and MultiDecoder's own load and move paths o
 - each of a point's files (.ids, .st, .json) has its pages dropped from the page cache after its fsync;
 - a decode round settles the reads once its verify pass is queued (every slot the last step copied out back to the
   reader, after the newest copy only), so beside a decoding stream a read slot turns every round;
-- a staged block records its write slot's own event (made at start), and the writer waits on that one.
+- a staged block records its write slot's own event (made at start), and the writer waits on that one;
 - LOADED on a rank with more blocks left than read slots returns: the wait for a block frees the slots the step's
-  own copies hold (a rank 1 whose rank 0 failed early hung there for ever).
+  own copies hold (a rank 1 whose rank 0 failed early hung there for ever);
+- the read-ahead (16 blocks unless TF_GLM_SPILL_READ_BLOCKS says otherwise; on two Sparks the preallocated read
+  buffers hold the first ten and 9 fits them, so the pool pays nothing for 9) keeps spill.preallocate's read buffers
+  and pins only the rest before the pool is sized, in power-of-two pieces of at most spill.CHUNK (torch's pinned
+  allocator rounds an allocation up to one), the bytes it returns (the pool's cost) those pieces only; ring carves
+  at least that many stored blocks out of them and pins none later.
 Exit code 1 when a check fails; tools/spill_blocks_mutants.sh runs it on faithful mutants of each fix.
 """
 import inspect
@@ -661,5 +666,73 @@ check("hang: LOADED on a rank that copied nothing before returns (the wait frees
 check("hang: the state is kept, its rows as stored", not t.is_alive() and len(m1.kept) == 1
       and same(rows(ar, h.x.base, nt), kept))
 
+# The same with the read slots carved as pin_read_ahead leaves them: a preallocated buffer that holds two and a half
+# blocks, the rest in one power-of-two piece, so the ring holds more slots than the 7 asked and some sit in each buffer.
+pinned, per = dict(SP._PINNED), S._up(st.block_bytes)
+saved, ROWS = ROWS, 22 * ALIGN
+os.environ.update(TF_GLM_SPILL_READ_BLOCKS="7", TF_GLM_SPILL_STAGE_MIB="1")
+try:
+    SP._PINNED.clear()
+    SP._PINNED["read"] = [torch.zeros(2 * per + per // 2, dtype=torch.uint8)]
+    took = S.pin_read_ahead(per)
+    ar = arena(510)
+    st = store(ar, "hangC", 1)
+    ids, kept = stored(st, ar, nt, 511)
+    m1 = decoder(ar, st, 1)
+finally:
+    ROWS = saved
+    for k in ("TF_GLM_SPILL_READ_BLOCKS", "TF_GLM_SPILL_STAGE_MIB"):
+        os.environ.pop(k, None)
+hi, lo, _ = S.key_ints(S.point_key(ids))
+m1.apply([M.LOAD, 6, hi, lo, nt, 0, align_up(nt), 0])
+h = m1.loads[0]
+check("hang, carved slots: 20 blocks through more than the 7 slots asked, carved from the preallocated buffer and one "
+      "piece", took > 0 and 7 < len(st.read_slots) < 20 and h.lj.total == 20)
+until(lambda: len(h.lj.queued) >= len(st.read_slots))
+t = threading.Thread(target=lambda: m1.apply([M.LOADED, 2, 0, 0]), daemon=True)
+t.start()
+t.join(8.0)
+check("hang, carved slots: LOADED on a rank that copied nothing before returns", not t.is_alive())
+check("hang, carved slots: the state is kept, its rows as stored", not t.is_alive() and len(m1.kept) == 1
+      and same(rows(ar, h.x.base, nt), kept))
+SP._PINNED.clear()
+SP._PINNED.update(pinned)
+
+saved, chunk, env = dict(SP._PINNED), SP.CHUNK, os.environ.pop("TF_GLM_SPILL_READ_BLOCKS", None)
+check("read-ahead: 16 blocks by default", S.read_blocks() == 16)
+SP._PINNED.clear()
+SP._PINNED["read"] = [torch.empty(SP.CHUNK, dtype=torch.uint8) for _ in range(2)]   # (preallocate's, 2 x 64 MiB)
+check("read-ahead: the default at two Sparks' block size keeps preallocate's read buffers and pins 64 + 32 MiB more, "
+      "what the pool pays (the engine's bytes a pool block there: 13.6-14.0 MB, a stored block 12.7 MB)",
+      S.pin_read_ahead(14_029_224) == 96 << 20 and len(SP._PINNED["read"]) == 4)
+os.environ["TF_GLM_SPILL_READ_BLOCKS"] = "9"
+SP._PINNED["read"] = [torch.empty(SP.CHUNK, dtype=torch.uint8) for _ in range(2)]
+check("read-ahead: 9 blocks fit preallocate's read buffers on two Sparks, so the pool pays nothing for them",
+      S.pin_read_ahead(14_029_224) == 0 and len(SP._PINNED["read"]) == 2)
+os.environ["TF_GLM_SPILL_READ_BLOCKS"] = "21"
+st = store(arena(105), "readahead")
+pe = 3 * S._up(st.block_bytes)       # (the engine's bytes a pool block, more than a stored block's, as on the Sparks)
+SP.CHUNK = 1 << (4 * pe - 1).bit_length()                  # (small pieces, a power of two as 64 MiB is)
+pre = [torch.zeros(SP.CHUNK, dtype=torch.uint8) for _ in range(2)]   # (preallocate's two read buffers)
+SP._PINNED.clear()
+SP._PINNED["read"] = list(pre)
+took = S.pin_read_ahead(pe)
+new = SP._PINNED["read"][2:]
+check("read-ahead: preallocate's read buffers kept, only the rest pinned before the pool, and only that charged",
+      len(SP._PINNED["read"]) > 2 and all(a is b for a, b in zip(SP._PINNED["read"], pre))
+      and took == sum(b.numel() for b in new)
+      and took + 2 * SP.CHUNK >= 21 * pe > took + 2 * SP.CHUNK - max(b.numel() for b in new))
+check("read-ahead: the rest in power-of-two pieces of at most spill.CHUNK",
+      bool(new) and all(b.numel() & (b.numel() - 1) == 0 and b.numel() <= SP.CHUNK for b in new))
+st.ring()
+check("read-ahead: ring carves at least the blocks asked from them and pins none later",
+      len(st.read_slots) >= 21 and {x.untyped_storage().data_ptr() for x in st.read_slots}
+      == {b.untyped_storage().data_ptr() for b in SP._PINNED["read"]})
+SP._PINNED.clear()
+SP._PINNED.update(saved)
+SP.CHUNK = chunk
+os.environ.pop("TF_GLM_SPILL_READ_BLOCKS", None)
+if env is not None:
+    os.environ["TF_GLM_SPILL_READ_BLOCKS"] = env
 print("all passed" if not fails else f"FAILED: {fails}", flush=True)
 os._exit(1 if fails else 0)
