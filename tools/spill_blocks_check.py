@@ -499,5 +499,19 @@ for _ in range(3):
     first.append(m.disk.calls[0])
 check(f"budget: each pause starts with the next read ({first})", sorted(first) == [0, 1, 2])
 
+# -- a restore beside decoding streams ends only once its budgeted copies are done (LOADED copies nothing then) ---------
+ar = arena(10)
+m = decoder(ar, store(ar, "ready"))
+done = threading.Event()
+done.set()
+h = NS(done=False, err=None, lj=NS(done=done, error=None, next=3, total=10))
+m.lanes = {1: NS(decoding=True, paused=False, s=NS(done=False))}
+check("ready: a read done with blocks left to copy waits while a stream decodes", not m.load_ready(h))
+h.lj.next = 10
+check("ready: every block copied, the restore ends", m.load_ready(h))
+h.lj.next = 3
+m.lanes = {}
+check("ready: nothing decoding, the rest is copied at once", m.load_ready(h))
+
 print("all passed" if not fails else f"FAILED: {fails}", flush=True)
 os._exit(1 if fails else 0)

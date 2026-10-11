@@ -68,6 +68,7 @@ run reader-copies $B "            fut = self._readers.submit(self._read_block, h
 run no-step $MU "                if self.disk.step(h.lj, budget=left):\n" "                if False:\n"
 # review (wojo#2): one budget a pause for every read in flight, and each read first in turn
 run budget-each-read $MU "                left = deadline - time.perf_counter()\n" "                left = budget\n"
+run ready-before-copies $MU "        if lj.error is not None or lj.next >= lj.total:\n            return True\n" "        return True\n"
 run budget-same-first $MU "            k = self.load_turn % len(live)" "            k = 0"
 run loadpart-not-sent $MU "                    self._emit(LOADPART, [h.lid, h.lj.next])\n" "                    pass\n"
 run loadpart-not-applied $MU "            elif op == LOADPART:\n                self._load_part(*p)" "            elif op == LOADPART:\n                pass"
