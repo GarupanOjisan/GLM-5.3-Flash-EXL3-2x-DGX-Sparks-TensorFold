@@ -56,54 +56,79 @@ worker_save_log() {
   worker "$1" "$(declare -f save_log); save_log \"\$HOME/.cache/tensorfold-glm53/logs\" $1 '$CONTAINER_NAME' '$LOG_KEEP'"
 }
 
-# settle_memory <max seconds>: wait until the memory this node freed in bulk is back in MemAvailable. Prints
-# "<MemAvailable at first> <at last> <seconds waited> <parked at first> <parked at last> <1 if it gave up>" (KiB; "-"
-# when /proc/zoneinfo cannot say). Freeing tens of GiB at once (the image's `docker save` / `docker load` in
-# prepare.sh, a server that has just stopped) leaves 5-9 GiB of it on the kernel's per-CPU free lists (the "count:"
-# lines under "pagesets" in /proc/zoneinfo). They are in neither MemFree nor MemAvailable and come back at only
-# ~0.1 GiB/s, for 1-2 minutes. TensorFold sizes the KV pool and the kept prompt states from MemAvailable when it
-# starts, so a start inside that window gets a smaller pool (measured: 89.5 against 95 GiB "within"). Waits while that
-# parked memory is above 384 MiB and still falling; without /proc/zoneinfo, while MemAvailable is still rising. Runs on
-# the workers too (its definition is sent over ssh): no config.sh there.
-settle_memory() {
-  local max=$1 t0=$SECONDS pg late=0 a0 a h0 h v n
-  local -a hist=()
-  pg=$(getconf PAGESIZE)
-  held() { awk -v pg="$pg" '/^ +count:/ { c += $2; n++ } END { if (n) print int(c * pg / 1024) }' /proc/zoneinfo 2>/dev/null; }
-  avail() { awk '/^MemAvailable:/ { print $2 }' /proc/meminfo; }
-  a0=$(avail); h0=$(held); h=$h0; a=$a0
-  while :; do
-    h=$(held); a=$(avail)
-    if [[ -n "$h" ]]; then
-      (( h > 393216 )) || break
-      v=$h
-    else
-      v=$(( -a ))
-    fi
-    hist+=("$v"); n=${#hist[@]}
-    (( n > 3 && hist[n-4] - v < 65536 )) && break      # not coming back any more: less than 64 MiB in the last 6 s
-    (( SECONDS - t0 < max )) || { late=1; break; }
-    sleep 2
-  done
-  echo "$a0 $a $(( SECONDS - t0 )) ${h0:--} ${h:--} $late"
+# settle_memory <max seconds>: wait until the memory this node freed in bulk is back in MemAvailable. Prints "waiting"
+# first when it has to wait, then "<MemAvailable at first> <at last> <seconds waited> <parked at first> <parked at last>
+# <1 if it gave up>" (KiB; "-" when /proc/zoneinfo has no per-CPU page lists to read, and then it does not wait).
+# Copying the image (`docker save` on the head, `docker load` on the worker, in prepare.sh) frees ~24 GiB of page
+# cache at once, and the kernel parks 5-9 GiB of it on the per-CPU free lists (the "count:" lines under "pagesets" in
+# /proc/zoneinfo). Those pages are in neither MemFree nor MemAvailable and come back at only ~0.1 GiB/s, over 1-2
+# minutes. TensorFold sizes the KV pool and the kept prompt states from MemAvailable when it starts, so a start inside
+# that window gets a smaller pool (measured: 89.5 against 95 GiB "within"). Waits while the parked memory is above its
+# resting level (the lists' high_min, plus 256 MiB; 512 MiB when high_min is not listed) and still changing by 64 MiB
+# or more in 6 s (it stops on a plateau, never while the count is rising). No /proc/zoneinfo pagesets (not an SMP
+# kernel): nothing to wait for, no fallback. Runs on the workers too (its definition and the two helpers below are
+# sent over ssh): no config.sh there. SETTLE_ZONEINFO, SETTLE_MEMINFO and SETTLE_INTERVAL (seconds, default 2) replace
+# /proc/zoneinfo, /proc/meminfo and the poll interval, for tools/settle_memory_check.sh.
+# _settle_zone <page size>: "<parked KiB> <resting KiB>" from the per-CPU page lists, empty when there are none
+_settle_zone() {
+  awk -v pg="$1" '/^ +count:/ { c += $2; n++ } /^ +high_min:/ { m += $2; k++ }
+    END { if (n) print int(c * pg / 1024), (k ? int(m * pg / 1024) + 262144 : 524288) }' \
+    "${SETTLE_ZONEINFO:-/proc/zoneinfo}" 2>/dev/null || true
 }
-# settle_memory_all <max seconds>: settle_memory on every node at once; says what it waited for
+_settle_avail() { awk '/^MemAvailable:/ { print $2 }' "${SETTLE_MEMINFO:-/proc/meminfo}" 2>/dev/null || true; }
+settle_memory() {
+  local max=$1 t0=$SECONDS pg late=0 a0 a z h0 h rest n d
+  local -a hist=()
+  pg=$(getconf PAGESIZE 2>/dev/null || echo 4096)
+  a0=$(_settle_avail); a=$a0
+  z=$(_settle_zone "$pg"); read -r h0 rest <<<"$z"; h=$h0
+  if [[ -z "$h0" ]] || (( h0 <= rest )); then echo "${a0:--} ${a:--} 0 ${h0:--} ${h:--} 0"; return 0; fi
+  echo waiting
+  while :; do
+    sleep "${SETTLE_INTERVAL:-2}"
+    a=$(_settle_avail); z=$(_settle_zone "$pg"); read -r h rest <<<"$z"
+    [[ -n "$h" ]] || break                             # the lists went away: nothing to read any more
+    (( h > rest )) || break
+    hist+=("$h"); n=${#hist[@]}
+    d=$(( n > 3 ? hist[n-4] - h : 1 << 40 ))           # fall in the last three looks (6 s); negative when rising
+    (( d >= 65536 || d <= -65536 )) || break           # plateau: not coming back any more
+    (( SECONDS - t0 < max )) || { late=1; break; }
+  done
+  echo "${a0:--} ${a:--} $(( SECONDS - t0 )) $h0 ${h:--} $late"
+}
+_settle_gib() { awk -v k="$1" 'BEGIN { if (k == "-") print "?"; else printf "%.1f", k / 1048576 }'; }
+# settle_memory_all <max seconds>: settle_memory on every node at once; says once that it is waiting, then what it
+# waited for
 settle_memory_all() {
-  local max=$1 i dir a0 a secs h0 h late where gib
+  local max=$1 i dir a0 a secs h0 h late where first s
+  local -a pids=()
   (( max > 0 )) || return 0
-  gib() { awk -v k="$1" 'BEGIN { if (k == "-") print "?"; else printf "%.1f", k / 1048576 }'; }
   dir=$(mktemp -d)
   settle_memory "$max" > "$dir/0" 2>/dev/null &
+  pids+=($!)
   for i in $(worker_ids); do
     [[ -z "${WORKER_DOWN[$i]:-}" ]] || continue
-    worker "$i" "$(declare -f settle_memory); settle_memory $max" > "$dir/$i" 2>/dev/null &
+    worker "$i" "$(declare -f _settle_zone _settle_avail settle_memory); settle_memory $max" > "$dir/$i" 2>/dev/null &
+    pids+=($!)
   done
-  wait
+  # each node answers within a second or two: either "waiting" or the result, which means it had nothing to wait for
+  for s in $(seq 1 25); do
+    first=1
+    for i in 0 $(worker_ids); do [[ -e "$dir/$i" ]] && { [[ -s "$dir/$i" ]] || first=0; }; done
+    (( first )) && break
+    sleep 0.2
+  done
+  if grep -qx waiting "$dir"/* 2>/dev/null; then
+    log "Memory: waiting up to $max s for the pages freed in bulk (the image copy) to come back (MEMORY_SETTLE_TIMEOUT)"
+  fi
+  wait "${pids[@]}" || true
   for i in 0 $(worker_ids); do
-    read -r a0 a secs h0 h late < "$dir/$i" 2>/dev/null || continue
-    [[ "$secs" =~ ^[0-9]+$ ]] && (( secs >= 2 )) || continue
+    [[ -e "$dir/$i" ]] || continue
+    read -r a0 a secs h0 h late < <(tail -n 1 "$dir/$i") || continue
+    [[ "$secs" =~ ^[0-9]+$ ]] && (( secs >= 1 )) || continue
     if (( i == 0 )); then where="here"; elif (( TP == 2 )); then where="on the worker"; else where="on $(worker_host "$i")"; fi
-    log "Memory $where: waited $secs s for freed pages to come back ($(gib "$a0") -> $(gib "$a") GiB available, $(gib "$h0") -> $(gib "$h") GiB parked on the per-CPU free lists)"
+    log "Memory $where: waited $secs s for freed pages to come back" \
+        "($(_settle_gib "$a0") -> $(_settle_gib "$a") GiB available, $(_settle_gib "$h0") -> $(_settle_gib "$h") GiB parked)"
     (( ! late )) || warn "memory $where was still coming back after $max s (MEMORY_SETTLE_TIMEOUT): going on; TensorFold sizes its pool from what is available now"
   done
   rm -rf "$dir"

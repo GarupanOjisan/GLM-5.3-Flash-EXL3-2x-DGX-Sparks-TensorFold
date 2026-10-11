@@ -30,8 +30,8 @@
 #            STATE_DIR, HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
 #   image    IMAGE, TF_VERSION, TF_REPO, BASE_IMAGE, GHCR_IMAGE, IMAGE_TAG / IMAGE_DIGEST (the pinned published
 #            image), CONTAINER_NAME
-#   setup    PREPARE (auto | 1 | 0), PULL, MIN_FREE_GB, IMAGE_FREE_GB, MEMORY_SETTLE_TIMEOUT, RSYNC_OPTS, HF_TOKEN (prepare.sh's downloads;
-#            required with ABLIT=1);
+#   setup    PREPARE (auto | 1 | 0), PULL, MIN_FREE_GB, IMAGE_FREE_GB, MEMORY_SETTLE_TIMEOUT, RSYNC_OPTS,
+#            HF_TOKEN (prepare.sh's downloads; required with ABLIT=1);
 #            FOREGROUND=1 (stay attached to rank 0's log, exit with its code); WAIT_TIMEOUT (seconds, default 1800);
 #            DRY_RUN=1 (print the docker commands, change nothing);
 #            STOP_TIMEOUT (stop.sh); LOG_DIR, LOG_KEEP (saved server logs)
@@ -284,8 +284,8 @@ if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
 fi
 # TensorFold budgets each Spark's free memory minus MEMORY_RESERVE_GIB (14.5); the defaults want ~110 GiB free at start on each.
 # With less, rank 0 refuses the window and names one that fits, which the load below then starts again with.
-# Memory freed in bulk a moment ago (prepare.sh's image copy, the server just stopped) is not in MemAvailable yet,
-# and TensorFold sizes its pool from MemAvailable when it starts: wait until it is back (scripts/nodes.sh).
+# Memory freed in bulk a moment ago (prepare.sh's image copy) is not in MemAvailable yet, and TensorFold sizes its
+# pool from MemAvailable when it starts: wait until it is back (scripts/nodes.sh).
 (( DRY )) || settle_memory_all "$MEMORY_SETTLE_TIMEOUT"
 here_gb=$(free -g | awk '/^Mem:/ {print $7}')
 low=0; (( here_gb >= 110 )) || low=1
