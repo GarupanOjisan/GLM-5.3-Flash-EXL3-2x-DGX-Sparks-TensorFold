@@ -11,10 +11,10 @@
 # for issue #122, reported by @xiepengqi; the rest by @wojo. Builds on 0088-glm-spill-tier. Apache-2.0.
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
 new file mode 100644
-index 0000000..86b3da2
+index 0000000..8c73db8
 --- /dev/null
 +++ tensorfold/cuda/spill_blocks.py
-@@ -0,0 +1,1674 @@
+@@ -0,0 +1,1699 @@
 +"""The spill tier's block store for a shared pool of cache rows (``tensorfold serve --spill-gib`` with several streams):
 +every kept prompt state is written to this rank's disk when it is kept, so it survives an eviction, a restart and a
 +crash, and a later request that extends the same tokens reads it back instead of prefilling them.
@@ -500,6 +500,7 @@ index 0000000..86b3da2
 +        self.slots: list[torch.Tensor] = []
 +        self.free_slots: queue.Queue = queue.Queue()
 +        self.dev_slot: torch.Tensor | None = None
++        self.slot_events: list = []                        # a write slot's event, reused by every block it stages
 +        self.read_slots: list[torch.Tensor] = []
 +        self._hasher = ThreadPoolExecutor(2, thread_name_prefix=f"spill-hash-{self.rank}")
 +        self._readers = ThreadPoolExecutor(READERS, thread_name_prefix=f"spill-read-{self.rank}")
@@ -655,7 +656,10 @@ index 0000000..86b3da2
 +    # -- the staging ring and read buffers ---------------------------------------------------------------------------
 +    def ring(self) -> None:
 +        """Pinned host slots of one block each for writes (carved from ``spill.preallocate``'s write buffers, else
-+        allocated now), and as many for reads, all touched now; a device buffer a block is gathered in."""
++        allocated now), and as many for reads, all touched now; a device buffer a block is gathered in; an event a
++        write slot, made here: making or dropping one later (the writer dropped one a block) waits for the engine's
++        round to end whenever it decodes (CUDA holds every other thread's call while the round's readback waits on the
++        default stream), ~27 ms a block beside a decoding stream."""
 +
 +        if self.slots:
 +            return
@@ -687,6 +691,11 @@ index 0000000..86b3da2
 +        if any(s.data_ptr() % _sp.ALIGN for s in self.slots + self.read_slots):
 +            self.direct = False
 +        self.dev_slot = torch.empty(per, dtype=torch.uint8, device=dev)
++        if dev.type == "cuda":
++            for _ in self.slots:
++                ev = torch.cuda.Event()
++                ev.record()                                 # (an event is made at its first record)
++                self.slot_events.append(ev)
 +        for i in range(len(self.slots)):
 +            self.free_slots.put(i)
 +
@@ -808,8 +817,9 @@ index 0000000..86b3da2
 +    def pump(self, limit: int | None = PUMP_BLOCKS) -> None:
 +        """Between rounds (the engine loop, every rank): the waiting states' next blocks, oldest first, into free slots
 +        - one device gather (a kernel: display-span rows too) and one copy to pinned memory each, on the current stream
-+        after whatever wrote the rows - handed to the writer with an event. A state whose blocks are all handed goes
-+        to the writer whole. Never waits; at most ``limit`` blocks (None: as many as the slots allow)."""
++        after whatever wrote the rows - handed to the writer with the slot's event (made at start, ``ring``). A state
++        whose blocks are all handed goes to the writer whole. Never waits; at most ``limit`` blocks (None: as many as
++        the slots allow)."""
 +
 +        if not self.pending:
 +            return
@@ -834,9 +844,8 @@ index 0000000..86b3da2
 +                    nb = sum(t.numel() for t in parts)
 +                    torch.cat(parts, out=self.dev_slot[:nb])
 +                    self.slots[slot][:nb].copy_(self.dev_slot[:nb], non_blocking=True)
-+                    ev = None
-+                    if self.dev_slot.device.type == "cuda":
-+                        ev = torch.cuda.Event()
++                    ev = self.slot_events[slot] if self.slot_events else None   # (made at start: a GPU's only)
++                    if ev is not None:
 +                        ev.record()
 +                except Exception as exc:                    # noqa: BLE001  (never the engine's: this state is not kept)
 +                    self.free_slots.put(slot)
@@ -1445,6 +1454,22 @@ index 0000000..86b3da2
 +                keep.append((b, ev))
 +        self.read_events = keep
 +
++    def settle(self) -> None:
++        """The engine (every rank), in a decode round once its verify pass is queued: every read slot copied out by
++        the last step (on this stream, before the round's work) back to the reader, waiting for the newest of those
++        copies while the GPU runs the queued pass. Without it a step frees only the slots the step before copied out,
++        so beside a decoding stream a slot turns every second round."""
++
++        evs = getattr(self, "read_events", None)        # (made with the slots, at the first read or write)
++        if not evs:
++            return
++        last = next((ev for _, ev in reversed(evs) if ev is not None), None)
++        if last is not None:
++            last.synchronize()                          # (one stream: the copies before it are done too)
++        for b, _ in evs:
++            self.free_reads.put(b)
++        self.read_events = []
++
 +    def step(self, lj: LoadJob, upto: int | None = None, budget: float | None = None) -> int:
 +        """The engine, between rounds (either rank): ``lj``'s next blocks into its extent, at its base now, on the
 +        current stream, in order. Without ``upto``: only blocks read already, for at most ``budget`` seconds; with it:
@@ -1705,7 +1730,7 @@ index 4fab28d..1f131ca 100644
              display = display_kv.credit()
              # one kept state's fixed cost outside the pool, the largest of any rank's: every rank derives the same count
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index 06f33e7..8a634e9 100644
+index 06f33e7..57f6aa6 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
 @@ -34,6 +34,7 @@ Multi-stream mode drafts with DFlash2 only: MTP policies are remapped to DFlash2
@@ -2420,7 +2445,19 @@ index 06f33e7..8a634e9 100644
              return self._iterate()
          except Exception as exc:
              self.broken = exc
-@@ -2244,6 +2256,8 @@ class MultiDecoder:
+@@ -2102,6 +2114,11 @@ class MultiDecoder:
+         if prof is not None:
+             prof.gpu_start()
+         v = forward_streams(verify, segments)
++        if self.disk is not None and self.loads:
++            try:
++                self.disk.settle()               # (reads' slots back beside the queued pass: a slot turns every round)
++            except Exception as exc:             # noqa: BLE001  (never the engine's failure: the read ends at LOADED)
++                print(f"[tensorfold] spill rank {self.rank}: read settle failed: {exc!r}", flush=True)
+         if prof is not None:
+             prof.gpu_stop()
+             prof.mark("verify")
+@@ -2244,6 +2261,8 @@ class MultiDecoder:
              self._emit(IDLE, [])
              self._flush()
              self.idle = True
@@ -2429,7 +2466,7 @@ index 06f33e7..8a634e9 100644
          _unwatch(self.watchdog)
          self.iteration_since = None
  
-@@ -2324,6 +2338,7 @@ class MultiDecoder:
+@@ -2324,6 +2343,7 @@ class MultiDecoder:
              _watch(self.watchdog, f"rank {self.rank} message")   # busy: rank 0's next message is due within a round
              self.apply(unseal(self.g._share(None), self.received, self.rank))
              self.received = (self.received + 1) % SEAL_MOD
@@ -2437,7 +2474,7 @@ index 06f33e7..8a634e9 100644
              _unwatch(self.watchdog)
              if once:
                  return
-@@ -2357,12 +2372,14 @@ class MultiDecoder:
+@@ -2357,12 +2377,14 @@ class MultiDecoder:
                  self._start_load(*p)
              elif op == LOADED:
                  self._finish_load(*p)
@@ -2456,7 +2493,7 @@ index 06f33e7..8a634e9 100644
              elif op == MOVE:
                  self._move(self.pool.get(p[0]), p[1], p[2])
              elif op == GROW:
-@@ -2405,6 +2422,8 @@ class MultiDecoder:
+@@ -2405,6 +2427,8 @@ class MultiDecoder:
                  if self.lanes:
                      raise RuntimeError(f"rank 1 holds {len(self.lanes)} streams rank 0 has finished")
                  self.idle = True
@@ -2465,7 +2502,7 @@ index 06f33e7..8a634e9 100644
              else:
                  raise RuntimeError(f"rank 1: unknown op {op}")
  
-@@ -2431,6 +2450,7 @@ class GlmScheduler(Scheduler):
+@@ -2431,6 +2455,7 @@ class GlmScheduler(Scheduler):
          self.flush_lock = threading.Lock()
          self.loading: list = []          # (read, item): requests waiting for a stored prompt read (--spill-gib)
          self.ready: list = []            # items whose read ended: admitted before the queue
@@ -2473,7 +2510,7 @@ index 06f33e7..8a634e9 100644
          self.staged: set = set()         # streams a read was looked for already
          # TF_GLM_MULTI_PREFILL_WAIT_MS: an idle server's wait for requests arriving with the first (their prompts then
          # share its first chunk); only with TF_GLM_MULTI_PREFILL=1
-@@ -2512,7 +2532,7 @@ class GlmScheduler(Scheduler):
+@@ -2512,7 +2537,7 @@ class GlmScheduler(Scheduler):
  
          if background or self.max_in_system is None:
              return
@@ -2482,7 +2519,7 @@ index 06f33e7..8a634e9 100644
          if held + self.waiting.foreground_count() >= self.max_in_system:
              raise CapacityError("all serving lanes are busy; retry shortly")
  
-@@ -2526,6 +2546,7 @@ class GlmScheduler(Scheduler):
+@@ -2526,6 +2551,7 @@ class GlmScheduler(Scheduler):
          import heapq
  
          self.ready = [it for it in self.ready if not self._cancel_item(it)]   # their stored prompts read (--spill-gib)
@@ -2490,7 +2527,7 @@ index 06f33e7..8a634e9 100644
          self.loading = [(read, None if it is None or self._cancel_item(it) else it) for read, it in self.loading]
          if self.held is not None and self._cancel_item(self.held):
              self.held = None
-@@ -2556,6 +2577,11 @@ class GlmScheduler(Scheduler):
+@@ -2556,6 +2582,11 @@ class GlmScheduler(Scheduler):
                  self.decoder.flush_spill()
              finally:
                  flush.set()
@@ -2502,7 +2539,7 @@ index 06f33e7..8a634e9 100644
          for it in [it for it in self.loading if self.decoder.load_ready(it[0])]:
              self.loading.remove(it)
              try:
-@@ -2601,6 +2627,13 @@ class GlmScheduler(Scheduler):
+@@ -2601,6 +2632,13 @@ class GlmScheduler(Scheduler):
                      self.loading.append((read, item))
                      continue
              self.staged.discard(id(stream))
@@ -2516,7 +2553,7 @@ index 06f33e7..8a634e9 100644
              self.boxes[id(stream)] = box
              try:
                  self.decoder.admit(stream)
-@@ -2669,7 +2702,7 @@ class GlmScheduler(Scheduler):
+@@ -2669,7 +2707,7 @@ class GlmScheduler(Scheduler):
      def _iteration(self) -> None:
          self._cancel_waiting()
          self._yield()

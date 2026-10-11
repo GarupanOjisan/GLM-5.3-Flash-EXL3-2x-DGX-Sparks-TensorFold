@@ -21,7 +21,10 @@ rows), with a stand-in small state, and MultiDecoder's own load and move paths o
 - a read that fails on a missing block file drops that name and the points naming it, not the points whose blocks
   are links to the same bytes (they still read back); one that fails on damaged bytes drops every name of them;
 - every op in multi's table has a sender, and /metrics carries the prefix wait's counters;
-- each of a point's files (.ids, .st, .json) has its pages dropped from the page cache after its fsync.
+- each of a point's files (.ids, .st, .json) has its pages dropped from the page cache after its fsync;
+- a decode round settles the reads once its verify pass is queued (every slot the last step copied out back to the
+  reader, after the newest copy only), so beside a decoding stream a read slot turns every round;
+- a staged block records its write slot's own event (made at start), and the writer waits on that one.
 Exit code 1 when a check fails; tools/spill_blocks_mutants.sh runs it on faithful mutants of each fix.
 """
 import inspect
@@ -470,6 +473,120 @@ key = S.point_key(ids)
 for suffix in (".ids", ".st", ".json"):
     mine = [what for what, f in events if f == f".{key}{suffix}"]
     check(f"pages: {suffix} dropped from the page cache after its fsync", mine == ["fsync", "drop"])
+
+# -- a read slot turns every round: beside a decoding stream the step between rounds frees only the slots the step
+# before copied out, so a slot turned every second round (profiled on GPU: the reader waited for slots 80% of a 226k
+# read, 14-18 blocks copied a round through 32 slots).
+class Stop(Exception):
+    pass
+
+
+def round_order(loading: bool) -> list:
+    """What a decode round does, in order, up to its sampling: its verify pass queued, the reads settled, sampled."""
+
+    a = arena(100)
+    s = store(a, f"round{int(loading)}")
+    m = decoder(a, s)
+    order: list = []
+    lane = NS(copies=None, dflash=False, depth=0, s=NS(out=[7], sampling=None, stop_eos=False), constraint=None,
+              st=NS(pos=0), window=None)
+    m.profile, m.tune, m.drafts, m.window, m.verify = None, NS(depth="", sampler=""), None, 64, NS()
+
+    def forward(verify, segments):
+        order.append("forward")
+        return NS(logits=[torch.zeros(1, 4)])
+
+    def sample(w, parts):
+        order.append("sample")
+        raise Stop
+
+    fwd, smp = M.forward_streams, M.sample_streams
+    M.forward_streams, M.sample_streams = forward, sample
+    s.settle = lambda: order.append("settle")
+    if loading:
+        m.loads[0] = NS()
+    try:
+        m._round([lane])
+    except Stop:
+        pass
+    finally:
+        M.forward_streams, M.sample_streams = fwd, smp
+    return order
+
+
+check("round: a decode round settles the reads once its verify pass is queued, before its readback",
+      round_order(True) == ["forward", "settle", "sample"])
+check("round: with no read under way a round settles nothing", round_order(False) == ["forward", "sample"])
+
+
+class StreamEv:
+    """A copy's event on one stream: waiting for it means every event recorded before it is done too."""
+
+    def __init__(self, line: list) -> None:
+        self.line, self.done, self.synced = line, False, 0
+        line.append(self)
+
+    def query(self) -> bool:
+        return self.done
+
+    def synchronize(self) -> None:
+        self.synced += 1
+        for e in self.line[:self.line.index(self) + 1]:
+            e.done = True
+
+
+def drained(q) -> list:
+    out = []
+    while not q.empty():
+        out.append(q.get_nowait())
+    return sorted(out)
+
+
+st = store(arena(104), "settle")
+try:
+    st.settle()
+    early = True
+except Exception as exc:                            # noqa: BLE001
+    print(f"     (settle before the slots: {exc!r})")
+    early = False
+check("settle: before the read slots exist it does nothing", early)
+st.ring()
+drained(st.free_reads)
+line: list = []
+evs = [StreamEv(line) for _ in range(3)]
+st.read_events = list(zip((4, 5, 6), evs))
+st._recycle()
+check("settle: a step's recycling between rounds waits for no copy", not drained(st.free_reads)
+      and all(e.synced == 0 for e in evs) and len(st.read_events) == 3)
+st.settle()
+check("settle: it waits for the newest copy only, and every slot copied out comes back",
+      drained(st.free_reads) == [4, 5, 6] and not st.read_events and [e.synced for e in evs] == [0, 0, 1])
+
+
+class Rec:
+    """A slot's event: counts its records and the writer's waits on it."""
+
+    def __init__(self) -> None:
+        self.records = self.syncs = 0
+
+    def record(self, stream=None) -> None:
+        self.records += 1
+
+    def synchronize(self) -> None:
+        self.syncs += 1
+
+
+ar = arena(102)
+st = store(ar, "wevents")
+st.ring()
+st.slot_events = [Rec() for _ in st.slots]          # (made at start on a GPU; none on the host)
+ids, kept = stored(st, ar, 3 * ALIGN - 6, 103)      # two blocks staged by the pumps, the tail copied at keep
+staged = st.stats["staged_blocks"]
+check("write: a staged block records its slot's own event, made at start, and the writer waits on that one (no event "
+      "made or dropped a block)", staged == 2 and sum(r.records for r in st.slot_events) == staged
+      and sum(r.syncs for r in st.slot_events) == staged)
+_, _, back = load_rows(st, ar, S.point_key(ids), Pool(ROWS).add(0, align_up(3 * ALIGN - 6)), 3 * ALIGN - 6)
+check("write: its rows read back as kept", back is not None and same(back, kept))
 
 # -- review (wojo#2): the reads in flight share one TF_GLM_SPILL_LOAD_MS pause between rounds, each first in turn ----
 class SlowDisk:
