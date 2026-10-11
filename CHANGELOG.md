@@ -127,7 +127,8 @@ Every change to this recipe, newest first. Each release names the image it serve
   [BadAd84](https://github.com/BadAd84), brought into the spill tier so there is one tier and one set of settings. The
   one-stream engine (`PARALLEL=1`) keeps its file a state. `SPILL_HIGHWATER` no longer changes anything.
   A restore reads ahead on 8 threads into pinned slots (`TF_GLM_SPILL_READ_BLOCKS`, 32) and the engine copies the
-  blocks read between rounds (`TF_GLM_SPILL_LOAD_MS`, 40 ms), as #118 does: issued from the reader's own thread, each
+  blocks read between rounds (`TF_GLM_SPILL_LOAD_MS`, 40 ms, one budget for every restore in flight, each first in
+  turn), as #118 does: issued from the reader's own thread, each
   copy waited on the decode loop (~0.25 ms a call against ~9 us idle), so a 260k-token restore beside a decoding stream
   took 1.0-1.3 s on two Sparks and 8.6-12.7 s on three (measured by [BadAd84](https://github.com/BadAd84)); now
   0.54-0.61 s (idle 0.40-0.46 s), the same replies. The read-ahead (388 MiB on two Sparks) is pinned before the

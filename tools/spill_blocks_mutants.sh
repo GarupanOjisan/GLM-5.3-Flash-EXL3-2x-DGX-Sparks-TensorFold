@@ -65,8 +65,11 @@ run read-at-first-base $B "        self.point, self.where = point, where\n" "   
     $B "        base = lj.where.base\n" "        base = lj.base0\n"
 # the reader reads, the engine copies between rounds; LOADPART takes rank 1 as far
 run reader-copies $B "            fut = self._readers.submit(self._read_block, h, pt.crcs[i], self.read_slots[b], nb)\n" "            fut = self._readers.submit(self._read_block, h, pt.crcs[i], self.read_slots[b], nb)\n            fut.result()\n            self._copy_in(lj, self.read_slots[b], s, e)\n            self.stats[\"loaded_bytes\"] += nb\n"
-run no-step $MU "            if self.disk.step(h.lj, budget=budget):\n" "            if False:\n"
-run loadpart-not-sent $MU "                self._emit(LOADPART, [h.lid, h.lj.next])\n" "                pass\n"
+run no-step $MU "                if self.disk.step(h.lj, budget=left):\n" "                if False:\n"
+# review (wojo#2): one budget a pause for every read in flight, and each read first in turn
+run budget-each-read $MU "                left = deadline - time.perf_counter()\n" "                left = budget\n"
+run budget-same-first $MU "            k = self.load_turn % len(live)" "            k = 0"
+run loadpart-not-sent $MU "                    self._emit(LOADPART, [h.lid, h.lj.next])\n" "                    pass\n"
 run loadpart-not-applied $MU "            elif op == LOADPART:\n                self._load_part(*p)" "            elif op == LOADPART:\n                pass"
 run loadpart-past-upto $B "        end = lj.total if upto is None else min(int(upto), lj.total)\n" "        end = lj.total\n"
 run loaded-without-rest $B "        if lj.error is None:\n            self.step(lj, upto=lj.total)\n" ""

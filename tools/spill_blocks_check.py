@@ -152,6 +152,7 @@ def decoder(ar: Arena, st: S.BlockStore, rank: int = 0) -> M.MultiDecoder:
     m.g = NS(cache_entries=8)
     m.kept, m.lanes, m.partial, m.loads, m.outbox = [], {}, None, {}, []
     m.next_lid = m.next_kid = 0
+    m.load_turn = 0
     m.broken, m.idle = None, False
     m._flush = lambda: None
     m._guard_pool()
@@ -469,6 +470,34 @@ key = S.point_key(ids)
 for suffix in (".ids", ".st", ".json"):
     mine = [what for what, f in events if f == f".{key}{suffix}"]
     check(f"pages: {suffix} dropped from the page cache after its fsync", mine == ["fsync", "drop"])
+
+# -- review (wojo#2): the reads in flight share one TF_GLM_SPILL_LOAD_MS pause between rounds, each first in turn ----
+class SlowDisk:
+    """A disk whose every step copies for as long as it may, 30 ms at most."""
+
+    def __init__(self) -> None:
+        self.calls: list = []
+
+    def step(self, lj, upto=None, budget=None):
+        self.calls.append(lj.name)
+        time.sleep(min(budget, 0.03))
+        return 1
+
+
+ar = arena(9)
+m = decoder(ar, store(ar, "budget"))
+m.disk, m.load_budget = SlowDisk(), 0.04
+m.loads = {i: NS(done=False, err=None, lid=i, lj=NS(error=None, next=0, name=i)) for i in range(3)}
+t = time.perf_counter()
+m.step_loads()
+took = time.perf_counter() - t
+check(f"budget: three reads in flight share one 40 ms pause (took {took * 1000:.0f} ms)", took < 0.06)
+first = []
+for _ in range(3):
+    m.disk.calls.clear()
+    m.step_loads()
+    first.append(m.disk.calls[0])
+check(f"budget: each pause starts with the next read ({first})", sorted(first) == [0, 1, 2])
 
 print("all passed" if not fails else f"FAILED: {fails}", flush=True)
 os._exit(1 if fails else 0)
