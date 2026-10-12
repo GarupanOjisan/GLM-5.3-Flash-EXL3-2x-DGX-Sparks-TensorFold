@@ -5,10 +5,10 @@
 # attend locally (taken back when needed). Same bits as unsharded. Spill tier and display reservation supported.
 # Builds on 0110 (spill tier) and 0111. By @wojo. Apache-2.0.
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
-index 4d20974..1cee6db 100644
+index 30b9cbe..b4f29fb 100644
 --- tensorfold/cuda/spill_blocks.py
 +++ tensorfold/cuda/spill_blocks.py
-@@ -747,7 +747,7 @@ class BlockStore:
+@@ -760,7 +760,7 @@ class BlockStore:
          items, layer = _sp.encode(obj, skip=skip)
          items = [(k, _host(t)) for k, t in items]          # (serialized on the writer thread)
          small_n = sum(t.numel() * t.element_size() for _, t in items) + 4096
@@ -17,7 +17,7 @@ index 4d20974..1cee6db 100644
          need = size + small_n + 8 * n * (2 if tokens is not None else 1)
          pt = Point(key, n, ids, None if tokens is None else np.asarray(tokens, dtype=np.int64), lineage,
                     [h for _, _, h in hashes], [], [], 0, small_n, bool(shared), bool(head), time.time(), None,
-@@ -786,6 +786,24 @@ class BlockStore:
+@@ -799,6 +799,24 @@ class BlockStore:
          self.stats["keep_s"] += time.perf_counter() - t0
          return "queued"
  
@@ -42,7 +42,7 @@ index 4d20974..1cee6db 100644
      def _parts(self, where, s: int, e: int) -> list[torch.Tensor]:
          """Tokens [s, e) as each plane's rows, where the extent is NOW (it may have moved)."""
  
-@@ -793,8 +811,9 @@ class BlockStore:
+@@ -806,8 +824,9 @@ class BlockStore:
          out = []
          for p in self.planes:
              a, b = _rows(p, s, e)
@@ -54,7 +54,7 @@ index 4d20974..1cee6db 100644
          return out
  
      def pump(self, limit: int | None = PUMP_BLOCKS) -> None:
-@@ -1402,7 +1421,7 @@ class BlockStore:
+@@ -1415,7 +1434,7 @@ class BlockStore:
              b = self._slot(lj)
              if b is None:
                  return
@@ -63,7 +63,7 @@ index 4d20974..1cee6db 100644
              fut = self._readers.submit(self._read_block, h, pt.crcs[i], self.read_slots[b], nb)
              with lj.cond:
                  lj.queued[i] = (b, nb, fut, s, e, h)
-@@ -1512,7 +1531,9 @@ class BlockStore:
+@@ -1525,7 +1544,9 @@ class BlockStore:
          at = 0
          for p in self.planes:
              a, z = _rows(p, s, e)
