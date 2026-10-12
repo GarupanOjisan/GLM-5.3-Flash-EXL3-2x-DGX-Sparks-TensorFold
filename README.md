@@ -309,7 +309,7 @@ with that window and says so (free memory on both Sparks for the full one). Othe
 | `KV=bf16 DRAFTER=mtp` | 524,288 | one request at a time |
 | `CONTEXT=0` | the largest that fits | no memory is left to keep other conversations' prompts |
 
-### KV sharding (optional, in testing)
+### KV sharding (optional)
 
 `TF_GLM_KV_SHARD=1` (patch `0118`, `PARALLEL` above 1) stores each conversation's latent cache once instead of on
 every Spark. Tensor parallelism splits the attention heads, but every head reads the whole MLA latent, so each Spark

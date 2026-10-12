@@ -5,7 +5,7 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
-- **KV sharding, in testing** (patch `0118-glm-kv-shard`, `TF_GLM_KV_SHARD=1`, off by default, by
+- **KV sharding** (patch `0118-glm-kv-shard`, `TF_GLM_KV_SHARD=1`, off by default, by
   [wojo](https://github.com/wojo)): each conversation's MLA latent cache is stored once, on the Spark that owns it,
   instead of on every Spark (tensor parallelism splits the heads, but every head reads the whole latent). The owner
   computes the decode attention of its rows; a prompt chunk on the other Sparks gets only the history rows its sparse
