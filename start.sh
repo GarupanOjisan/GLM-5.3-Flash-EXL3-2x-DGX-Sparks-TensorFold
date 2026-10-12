@@ -30,8 +30,8 @@
 #            STATE_DIR, HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
 #   image    IMAGE, TF_VERSION, TF_REPO, BASE_IMAGE, GHCR_IMAGE, IMAGE_TAG / IMAGE_DIGEST (the pinned published
 #            image), CONTAINER_NAME
-#   setup    PREPARE (auto | 1 | 0), PULL, MIN_FREE_GB, IMAGE_FREE_GB, MEMORY_SETTLE_TIMEOUT, RSYNC_OPTS,
-#            HF_TOKEN (prepare.sh's downloads; required with ABLIT=1);
+#   setup    PREPARE (auto | 1 | 0), PULL, MIN_FREE_GB, IMAGE_FREE_GB, RSYNC_OPTS, HF_TOKEN (prepare.sh's downloads;
+#            required with ABLIT=1);
 #            FOREGROUND=1 (stay attached to rank 0's log, exit with its code); WAIT_TIMEOUT (seconds, default 1800);
 #            DRY_RUN=1 (print the docker commands, change nothing);
 #            STOP_TIMEOUT (stop.sh); LOG_DIR, LOG_KEEP (saved server logs)
@@ -90,7 +90,6 @@ fi
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 [[ "$KV_POOL_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "KV_POOL_GIB is a number of GiB, not $KV_POOL_GIB"
 [[ "$MEMORY_RESERVE_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "MEMORY_RESERVE_GIB is a number of GiB, not $MEMORY_RESERVE_GIB"
-[[ "$MEMORY_SETTLE_TIMEOUT" =~ ^[0-9]+$ ]] || die "MEMORY_SETTLE_TIMEOUT is a number of seconds, not $MEMORY_SETTLE_TIMEOUT"
 [[ "$COPY_MAX" =~ ^([1-9]|1[0-5])$ ]] || die "COPY_MAX is 1 to 15, not $COPY_MAX"
 [[ "$DRAFT_POLICY" == f* ]] || die "DRAFT_POLICY is a DFlash2 policy (fc5:0.3, fnc7:0.3, fcost7:noisy ...), not $DRAFT_POLICY"
 # decode settings the ranks read at load (scripts/config.sh): checked here so a typo fails before anything is stopped
@@ -284,14 +283,12 @@ if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
 fi
 # TensorFold budgets each Spark's free memory minus MEMORY_RESERVE_GIB (14.5); the defaults want ~110 GiB free at start on each.
 # With less, rank 0 refuses the window and names one that fits, which the load below then starts again with.
-# Memory freed in bulk a moment ago (prepare.sh's image copy) is not in MemAvailable yet, and TensorFold sizes its
-# pool from MemAvailable when it starts: wait until it is back (scripts/nodes.sh).
-# What is still parked counts as available below (patch 0119 makes TensorFold's budget count it too).
-(( DRY )) || settle_memory_all "$MEMORY_SETTLE_TIMEOUT"
+# Memory freed in bulk a moment ago (prepare.sh's image copy) can still sit on the kernel's per-CPU free lists, outside
+# MemAvailable. It counts as available below, as in TensorFold's budget (patch 0119); see _avail_gb in scripts/nodes.sh.
 here_gb=$(_avail_gb)
 low=0; (( here_gb >= 110 )) || low=1
 for i in $(worker_ids); do
-  there_gb[i]=$(worker "$i" "$(declare -f _settle_zone _settle_avail _avail_gb); _avail_gb" 2>/dev/null || echo 0)
+  there_gb[i]=$(worker "$i" "$(declare -f _parked_zone _mem_avail _avail_gb); _avail_gb" 2>/dev/null || echo 0)
   (( there_gb[i] >= 110 )) || low=1
 done
 if (( ! low )); then

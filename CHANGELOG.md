@@ -5,37 +5,20 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
-- **The start-up budget counts the pages parked on the per-CPU free lists** (patch `0119-cuda-budget-parked-pages`, by
-  [wojo](https://github.com/wojo); CPU-checked, GPU validation pending). On kernel 6.7+ a bulk free leaves GiBs of
-  free pages on the per-CPU lists (`pagesets` `count:` in `/proc/zoneinfo`), in neither `MemFree` nor `MemAvailable`.
-  Besides the image copy that `MEMORY_SETTLE_TIMEOUT` waits for, the first start of a new image compiles
-  `tensorfold_roce_v1` inside the rank container ~1 s before the budget is read, and that parks 2.4 GiB
-  (`MemAvailable` -2.41 GiB at +1 s, -0.53 GiB at +49 s): the first start read 89.2 GiB "within" against 94.4 for a
-  restart, and `start.sh` cannot see it. `capacity.admit` now reads the lists once (every zone and CPU, less their
-  `high_min:` resting level, so a warm start's idle 0.28 GiB, 0.11 GiB over it, does not move the budget; 0 when
-  `/proc/zoneinfo` is unreadable) and adds the excess to `MemAvailable` (capped at `MemTotal`) for `available_bytes` and
-  `page_room`, and the start-up log says how many it counted. Only that start-up read counts them: the Qwen families'
-  live memory gate keeps its figure, and the GLM family reads `MemAvailable` nowhere else. `start.sh`'s own
-  "memory available" check (and its warning below ~110 GiB) counts the same excess, so a first start with
-  `MEMORY_SETTLE_TIMEOUT=0` does not warn spuriously; the default of the wait is unchanged until the patch is validated on
-  the GPUs. `tools/parked_pages_check.py`, `tools/settle_memory_check.sh`.
-- **The first start of a new image no longer gets a smaller pool** (`MEMORY_SETTLE_TIMEOUT`, scripts only, no patch,
-  by [wojo](https://github.com/wojo)). TensorFold budgets each rank from `MemAvailable` at start; the first start of an
-  image the worker lacked (the `docker save` / `docker load` copy in `prepare.sh`) read 89.5 GiB on rank 0 and 88.2 on
-  rank 1 against 94-95 for the second start of the same image, and kept 2 prompt states, not 32. Measured with 1 s
-  samples of `/proc/meminfo` and `/proc/zoneinfo` on both Sparks: the copy frees ~24 GiB of page cache in one go, and
-  the kernel parks 8.5 GiB of it (head) and ~9 GiB (worker) on the per-CPU free lists, which count in neither
-  `MemFree` nor `MemAvailable` (`kpageflags`: refcount-0 pages in no free list; `zoneinfo`: `pagesets` `count:`
-  8.56 GiB). They come back at ~0.1 GiB/s and are gone after 1-2 minutes, while the engine reads `MemAvailable` ~15 s
-  after the copy ends. Not dockerd or containerd (RSS flat at ~130 MB), not dirty pages (0.02 GiB by then), not the
-  verify container, and not kernel compilation (the kernels are cached per image). A stop followed at once by a start
-  of the same image was not affected (second start 94.67 / 95.42 without the wait). `start.sh` now waits before its
-  memory check, on both Sparks at once, until the parked pages are back or stop coming back (up to
-  `MEMORY_SETTLE_TIMEOUT` s, default 180; `0` skips it), says that it is waiting and how long it waited; with
-  nothing parked it costs about a second. First start of a new image, TP=2: rank 0 "within" 89.47 -> 94.63 GiB,
-  rank 1 88.24 -> 95.27, all 32 prompt states kept; the wait was 78 s here and 98 s on the worker (a second new
-  image: 94.70 / 95.06, waits 86 s / 105 s). A second start of the same image waits ~1 s and gets 94.8 / 95.5. CPU
-  check of the wait's logic on synthetic samples: `tools/settle_memory_check.sh`.
+- **The first start of a new image no longer gets a smaller pool** (patch `0119-cuda-budget-parked-pages`, by
+  [wojo](https://github.com/wojo)). TensorFold budgets each rank from `MemAvailable` at start; the first start of an
+  image the worker lacked read 89.4 GiB "within" on rank 0 against 94-95 for the second start of the same image, and
+  kept 2 prompt states, not 32. On kernel 6.7+ a bulk free leaves GiBs of free pages on the per-CPU lists (`pagesets`
+  `count:` in `/proc/zoneinfo`), in neither `MemFree` nor `MemAvailable`: the image copy in `prepare.sh` (`docker save`
+  / `docker load`) parks 5-9 GiB there, which comes back at ~0.1 GiB/s over 1-2 minutes, and the first start of a new
+  image compiles `tensorfold_roce_v1` inside the rank container ~1 s before the budget is read, which parks 2.4 GiB
+  more. `capacity.admit` now reads the lists once at start-up (every zone and CPU, less their `high_min:` resting
+  level, so a warm start's idle 0.28 GiB, 0.11 GiB over it, does not move the budget; 0 when `/proc/zoneinfo` is
+  unreadable) and adds the excess to `MemAvailable` (capped at `MemTotal`) for `available_bytes` and `page_room`, and
+  the start-up log says how many it counted. Only that start-up read counts them: the Qwen families' live memory gate
+  keeps its figure, and the GLM family reads `MemAvailable` nowhere else. `start.sh`'s own "memory available" check
+  (and its warning below ~110 GiB) counts the same excess. Cold first start of a new image, TP=2: 94.58 GiB "within"
+  against 89.44 with nothing counted. CPU check on synthetic zoneinfo / meminfo files: `tools/parked_pages_check.py`.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at
