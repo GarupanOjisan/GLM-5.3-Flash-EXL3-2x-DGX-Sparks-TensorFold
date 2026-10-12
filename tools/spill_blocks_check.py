@@ -25,6 +25,8 @@ rows), with a stand-in small state, and MultiDecoder's own load and move paths o
 - a decode round settles the reads once its verify pass is queued (every slot the last step copied out back to the
   reader, after the newest copy only), so beside a decoding stream a read slot turns every round;
 - a staged block records its write slot's own event (made at start), and the writer waits on that one.
+- LOADED on a rank with more blocks left than read slots returns: the wait for a block frees the slots the step's
+  own copies hold (a rank 1 whose rank 0 failed early hung there for ever).
 Exit code 1 when a check fails; tools/spill_blocks_mutants.sh runs it on faithful mutants of each fix.
 """
 import inspect
@@ -629,6 +631,35 @@ check("ready: every block copied, the restore ends", m.load_ready(h))
 h.lj.next = 3
 m.lanes = {}
 check("ready: nothing decoding, the rest is copied at once", m.load_ready(h))
+
+# -- LOADED on a rank that copied little: the wait for a block frees the read slots the step's own copies hold ---------
+# Rank 0's read failed early (LOADED came with no LOADPART before it) and rank 1 has more blocks left than read slots:
+# its step copies a slot's worth, and the reader needs those slots back to read the next block. They went back only at
+# the top of the next step, so the wait for that block starved the reader for ever (the rank-1 watchdog then exits).
+saved, ROWS = ROWS, 22 * ALIGN
+os.environ.update(TF_GLM_SPILL_READ_BLOCKS="8", TF_GLM_SPILL_STAGE_MIB="1")
+try:
+    ar = arena(500)
+    st = store(ar, "hang", 1)
+    nt = 20 * ALIGN
+    ids, kept = stored(st, ar, nt, 501)
+    m1 = decoder(ar, st, 1)
+finally:
+    ROWS = saved
+    for k in ("TF_GLM_SPILL_READ_BLOCKS", "TF_GLM_SPILL_STAGE_MIB"):
+        os.environ.pop(k, None)
+hi, lo, _ = S.key_ints(S.point_key(ids))
+m1.apply([M.LOAD, 6, hi, lo, nt, 0, align_up(nt), 0])
+h = m1.loads[0]
+check("hang: 20 blocks through 8 read slots", len(st.read_slots) == 8 and h.lj.total == 20)
+until(lambda: len(h.lj.queued) >= 8)
+t = threading.Thread(target=lambda: m1.apply([M.LOADED, 2, 0, 0]), daemon=True)
+t.start()
+t.join(8.0)
+check("hang: LOADED on a rank that copied nothing before returns (the wait frees the slots its copies hold)",
+      not t.is_alive())
+check("hang: the state is kept, its rows as stored", not t.is_alive() and len(m1.kept) == 1
+      and same(rows(ar, h.x.base, nt), kept))
 
 print("all passed" if not fails else f"FAILED: {fails}", flush=True)
 os._exit(1 if fails else 0)
