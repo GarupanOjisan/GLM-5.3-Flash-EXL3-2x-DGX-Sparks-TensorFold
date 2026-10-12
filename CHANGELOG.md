@@ -5,6 +5,15 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **KV sharding, in testing** (patch `0118-glm-kv-shard`, `TF_GLM_KV_SHARD=1`, off by default, by
+  [wojo](https://github.com/wojo)): each conversation's MLA latent cache is stored once, on the Spark that owns it,
+  instead of on every Spark (tensor parallelism splits the heads, but every head reads the whole latent). The owner
+  computes the decode attention of its rows; a prompt chunk on the other Sparks gets only the history rows its sparse
+  attention selects, or borrows free rows and attends locally. Two Sparks, `PARALLEL=8`: the pool holds 1.87x the tokens
+  (1.51M -> 2.83M; 1.85M -> 3.47M with `DISPLAY_KV_MIB=1792`), every reply byte-equal to the unsharded engine's, decode
+  within 1%, prompts within noise when rows can be borrowed and +1.8-3.5% when they are sent. Builds on `0110` and
+  `0111`. CPU check: `tools/kv_shard_check.py`.
+
 - **A rewound conversation keeps its id** (patch `0111-glm-chat-continued`, by [wojo](https://github.com/wojo)): patch
   `0089` gave a stream a new conversation id unless it resumed from one of that conversation's own turn states, so a
   client rewinding before the kept turns (issue #104, @danielbanu), a state read back from the spill tier, or dropped
