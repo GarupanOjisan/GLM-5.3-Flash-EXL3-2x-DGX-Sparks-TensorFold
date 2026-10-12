@@ -328,6 +328,9 @@ keeps its latents, the pooled keys staying on every Spark: 3,300 bytes a token a
 - **Pool**: evictions happen in one part only, the one whose newest needed eviction is the oldest; a new conversation
   goes to the part with fewer live streams. The spill tier and the display reservation work with it (each Spark stores
   what it holds; a restore goes back into its part). Not with `TF_GLM_MULTI_LONE`.
+- **Refused at start**, with the reason: `TF_GLM_MULTI_VERIFY=serial`, and a part under 131,072 tokens or a quarter
+  of the window. A part a little short of the window (a first start of a new image) caps a request at what a part
+  holds, logged once at start.
 
 Measured on two Sparks (`PARALLEL=8`, default reserve), every reply byte-equal to the unsharded engine's (concurrent
 streams, 60k to ~1M-token prompts, real text, multi-turn, borrows taken back mid-prompt, spill restores, prefix waits):

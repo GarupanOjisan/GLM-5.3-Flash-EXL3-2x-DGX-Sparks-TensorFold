@@ -5,7 +5,7 @@
 # attend locally (taken back when needed). Same bits as unsharded. Spill tier and display reservation supported.
 # Builds on 0110 (spill tier) and 0111. By @wojo. Apache-2.0.
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
-index 8c73db8..a43e6c9 100644
+index 4d20974..1cee6db 100644
 --- tensorfold/cuda/spill_blocks.py
 +++ tensorfold/cuda/spill_blocks.py
 @@ -747,7 +747,7 @@ class BlockStore:
@@ -63,7 +63,7 @@ index 8c73db8..a43e6c9 100644
              fut = self._readers.submit(self._read_block, h, pt.crcs[i], self.read_slots[b], nb)
              with lj.cond:
                  lj.queued[i] = (b, nb, fut, s, e, h)
-@@ -1510,7 +1529,9 @@ class BlockStore:
+@@ -1512,7 +1531,9 @@ class BlockStore:
          at = 0
          for p in self.planes:
              a, z = _rows(p, s, e)
@@ -75,28 +75,69 @@ index 8c73db8..a43e6c9 100644
              v = dst.reshape(-1).view(torch.uint8)
              if p.spanned:
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 1f131ca..1a7c798 100644
+index 1f131ca..986e05d 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
-@@ -792,6 +792,26 @@ class GlmEngine:
+@@ -599,6 +599,14 @@ class GlmEngine:
+         if kv != "bf16" and not LATENT:
+             raise ValueError("TF_GLM_KV=fp8 holds the latent cache: it needs TF_GLM_LATENT=1")
+         self.kv = kv
++        from . import shard
++
++        if shard.ON and parallel > 1:       # settings the shard cannot serve, refused now rather than at a request
++            from .multi import verify_kind
++
++            why = shard.unsupported(verify_kind())
++            if why:
++                raise ValueError(why)
+         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
+         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers) and parallel == 1   # multi: DFlash2
+         if not self.mtp_on:
+@@ -703,7 +711,8 @@ class GlmEngine:
+         self.agreed = mine[:1] + mine[2:]     # the spill tier's folders are keyed on these (not the window's slots)
+         from .multi import PRELAUNCH                          # TF_GLM_DRAFT_PRELAUNCH: every rank alike
+ 
+-        mine = mine + [int(PRELAUNCH)]                      # checked alike, not in the spill tier's key (``agreed``)
++        # checked alike, not in the spill tier's key (``agreed``; the shard's is in its store's signature, multi.py)
++        mine = mine + [int(PRELAUNCH), int(shard.ON)]
+         rows = self._gather_ints(mine + [spare >> 20])
+         odd = [r for r, row in enumerate(rows) if row[:-1] != rows[0][:-1]]
+         if odd:
+@@ -713,7 +722,7 @@ class GlmEngine:
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
+-                               "TF_GLM_DRAFT_PRELAUNCH): "
++                               "TF_GLM_DRAFT_PRELAUNCH, TF_GLM_KV_SHARD): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+@@ -792,6 +801,33 @@ class GlmEngine:
              print("[tensorfold] the checkpoint's MTP head is not loaded (TF_GLM_MTP=" +
                    (os.environ.get("TF_GLM_MTP", "").strip() or MTP_DEFAULT) + "): " +
                    ("DFlash2 drafts every request" if drafter is not None else "--no-drafts"), flush=True)
-+        from . import shard
-+
 +        if shard.ON:                            # TF_GLM_KV_SHARD: the latent cache once over the ranks
 +            if parallel < 2 or pool_rows is None or world < 2 or os.environ.get("TF_GLM_MULTI_LONE", "0") == "1":
 +                raise ValueError("TF_GLM_KV_SHARD=1 needs --parallel above 1, two ranks or more, and no "
 +                                 "TF_GLM_MULTI_LONE")
 +            dsa = len([l for l in w.layers if l.kind == "dsa"])
++            # a part's owner is ``base // HALF``: every rank must size the parts alike, and each computed the
++            # unsharded pool from its own KDA state size (they differ at three ranks): all take the smallest
++            pool_rows, display_rows = shard.agree(self._gather_ints([pool_rows, display_rows]))
 +            unsharded = pool_rows
-+            pool_rows = shard.sizes(pool_rows, dsa, kv, capacity, world)
-+            if display:                          # the reservation's bytes, at a sharded token's cost
-+                display_rows = pool_rows - shard.sizes(unsharded - display_rows, dsa, kv, capacity, world)
++            pool_rows, note = shard.plan(pool_rows, dsa, kv, self.limit, world, MAX_ROWS)
++            if display:                          # the reservation's bytes, at a sharded token's cost (never past the pool)
++                display_rows = max(0, pool_rows - shard.budget(unsharded - display_rows, dsa, kv, world))
++            same = self._gather_ints([pool_rows, display_rows])
++            if any(r != same[0] for r in same):
++                raise RuntimeError(f"TF_GLM_KV_SHARD: the ranks sized the sharded pool differently {same}")
++            if note and rank == 0:
++                print(f"[tensorfold] TF_GLM_KV_SHARD: {note}", flush=True)
 +            from . import tp
 +
 +            shard.setup(rank, world, pool_rows, heads=[tp.of(w).at(r).heads for r in range(world)])
-+            self.limit = min(self.limit, shard.HALF - MAX_ROWS)
++            self.limit = min(self.limit, shard.HALF - MAX_ROWS)        # (a stream lives in one part: what plan noted)
++            self.capacity_plan["context_window"] = self.limit
 +            self.capacity_plan["pool_tokens"] = pool_rows
 +            if rank == 0:
 +                print(f"[tensorfold] TF_GLM_KV_SHARD: the latent cache once over the {world} ranks: a pool of "
@@ -106,7 +147,7 @@ index 1f131ca..1a7c798 100644
          self.drafter_dir = drafter
          if drafter is not None:
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index bbae712..423a546 100644
+index bbae712..82b432c 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
 @@ -12,7 +12,7 @@ from tensorfold.cuda import experts as grouped
@@ -152,28 +193,31 @@ index bbae712..423a546 100644
              return add((HL, c.qk_dim)), add((HL, c.v_dim))
  
          self.kc, self.vc = [], []
-@@ -246,6 +251,8 @@ class Caches:
+@@ -246,6 +251,9 @@ class Caches:
                                      for _ in range(2)) for _ in range(n_idx)]
          self.arena = Arena(rows, planes)
          self.rows = rows
 +        if sharded:
 +            shard.ROW = kv8.row_bytes(c.kv_lora, kv)
++            shard.DTYPE = torch.uint8 if kv == "fp8" else torch.bfloat16
  
      def index_tensors(self, i: int) -> tuple:
          """Indexed layer i's (keys, gates, pooled keys) over every stream: the rings (or planes) and the pool plane."""
-@@ -267,7 +274,10 @@ class Caches:
+@@ -267,7 +275,12 @@ class Caches:
          """Point ``st``'s caches at tokens [base, base + size) of the pool."""
  
          view = lambda i: None if i is None else self.arena.view(i, base, size)     # noqa: E731
 -        st.kc = [view(i) for i in self.kc]
 +        tb = getattr(st, "twin_base", None)        # TF_GLM_KV_SHARD: a filling prompt's rows in this rank's half
++        if tb is not None and getattr(st, "twin_size", size) != size:     # (its twin has the extent's size: both
++            raise ValueError(f"a filling prompt's extent of {size} rows with a twin of {st.twin_size}")   # hold it)
 +        lat = view if tb is None or shard.owns(base) else (
 +            lambda i: None if i is None else self.arena.view(i, tb, size))         # noqa: E731
 +        st.kc = [lat(i) for i in self.kc]
          st.vc = [view(i) for i in self.vc]
          if self.mtp is not None:
              st.mtp_kc, st.mtp_vc = view(self.mtp[0]), view(self.mtp[1])
-@@ -593,8 +603,9 @@ def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
+@@ -593,8 +606,9 @@ def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
  
  def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
                R: int, nch: int | None, index=None, host_pos: int | None = None,
@@ -185,7 +229,7 @@ index bbae712..423a546 100644
  
      c = w.cfg
      a = layer.dsa
-@@ -602,7 +613,8 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+@@ -602,7 +616,8 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
          dsa_front(layer, w, b, lo, hi)
      HL = a.heads
      if a.absorb is not None:
@@ -195,7 +239,7 @@ index bbae712..423a546 100644
      if sparse_np is not None:
          raise ValueError("sparse CUDA graphs need the latent cache (TF_GLM_LATENT=1)")
      mm(b, b.lat[:R], a.kv_k, b.xs_lat[:R], b.kn[:R].view(R, HL * c.qk_dim))
-@@ -660,15 +672,68 @@ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s
+@@ -660,15 +675,71 @@ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s
  
  
  def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
@@ -235,13 +279,16 @@ index bbae712..423a546 100644
 +        hist, _ = shard.history(tokens[:R], host_pos, owner=True)
 +    else:                                        # the count (what arrives) and the tokens renumbered into the copy
 +        hist, tok = shard.history(tokens[:R], host_pos, owner=False)
-+    rb = lc.shape[1] if lc is not None else shard.ROW
++    # (rows travel as bytes: a bf16 plane's row is 1,024 of them, an FP8 plane's 528, and the receiver views its copy
++    # back as the cache's type)
++    lcb = shard.as_bytes(lc)
++    rb = lcb.shape[1] if lcb is not None else shard.ROW
 +    with prof.timed("dsa: shard fetch"):
-+        got = shard.fetch(w.comm, lc, hist, rb, dev, extra=R, root=root)
++        got = shard.fetch(w.comm, lcb, hist, rb, dev, extra=R, root=root)
 +    att = lc
 +    if lc is None:                               # the fetched rows, then the chunk's own (identity: at their positions)
 +        n = hist if isinstance(hist, int) else int(hist.numel())
-+        att = got
++        att = shard.as_cache(got)
 +        if identity:
 +            latent.latent_write(b.lat[rs], att, pos_dev)
 +        else:
@@ -267,7 +314,7 @@ index bbae712..423a546 100644
      """``_dsa_latent`` up to its output projection, for rows lo .. lo + R of the buffers (their front done) on one
      stream's caches (``lc``, ``index``, ``pos_dev``, ``host_pos``: its first row's position): the latent write,
      indexer update, absorb, attention and expand; returns the rows' attention output [R, heads * v_dim] (b.vn's rows).
-@@ -679,8 +744,10 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+@@ -679,8 +750,10 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
      HL = a.heads
      s = b.lat_s
      rs = slice(lo, lo + R)
@@ -280,7 +327,7 @@ index bbae712..423a546 100644
      # sparse_np: every row is past the dense limit (a captured graph); else the host position decides
      all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
      sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
-@@ -696,6 +763,14 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+@@ -696,6 +769,14 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
      l2pf.site(layer, "o")
      ol = s.ol[rs]
      scale = c.qk_dim ** -0.5
@@ -295,7 +342,7 @@ index bbae712..423a546 100644
      if not all_sparse:
          # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it
          # and only the rows before it (a row's dense bits do not depend on the rows after it: latent.attention).
-@@ -717,6 +792,13 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+@@ -717,6 +798,13 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
          return latent.expand_v(ol, a.absorb, b.vn[rs], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
  
  
@@ -309,7 +356,7 @@ index bbae712..423a546 100644
  def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
                   select: bool = True) -> torch.Tensor | None:
      """dsa_block on the latent cache for a multi-stream window (``rows``: segments.SegRows, already set): several
-@@ -736,8 +818,9 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
+@@ -736,8 +824,9 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
      HL = a.heads
      mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
      s = b.lat_s
@@ -321,7 +368,7 @@ index bbae712..423a546 100644
      tokens = counts = None
      if index is not None:
          ik, ig, pk = index
-@@ -754,7 +837,10 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
+@@ -754,7 +843,10 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
          qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
      l2pf.site(layer.index, "o")
      with prof.timed("dsa: attention"):
@@ -333,7 +380,7 @@ index bbae712..423a546 100644
      with prof.timed("dsa: expand"):
          o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
      return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))
-@@ -840,7 +926,9 @@ def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int |
+@@ -840,7 +932,9 @@ def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int |
      di = st.dsa_index[layer.index]
      with prof.timed("dsa (total)"):
          return dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
@@ -345,7 +392,7 @@ index bbae712..423a546 100644
  
  def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, int] | None = None) -> torch.Tensor | None:
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index 33dc834..ccca627 100644
+index 33dc834..83d14ba 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
 @@ -51,16 +51,16 @@ from tensorfold.cuda.scheduler import Scheduler
@@ -387,23 +434,84 @@ index 33dc834..ccca627 100644
          self.arena = e.caches.arena
          self.grid = engine.grid
          self.fill_rows = fill_rows(e.prefill_rows, self.grid)
-@@ -605,6 +608,7 @@ class MultiDecoder:
+@@ -605,6 +608,8 @@ class MultiDecoder:
          self.lanes: dict[int, Lane] = {}                 # by sid, in admission order
          self.kept: list = []                             # kept prompts (decode.Snapshot + kid, extent), oldest first
          self.load_turn = 0                               # which read in flight ``step_loads`` serves first
 +        self.twins = {"made": 0, "revoked": 0}           # TF_GLM_KV_SHARD: prompts filled with borrowed rows
++        self.no_part = 0                                 # TF_GLM_KV_SHARD: placements refused (no part could make room)
          self.boot = os.urandom(6).hex()                  # this process's lineages (a fresh prefill's) are its own
          self.prefix_waits = 0                            # requests that waited for a prefix another one prefilled
          self.prefix_wait_tokens = 0                      # the prompt tokens they did not prefill again
-@@ -641,6 +645,7 @@ class MultiDecoder:
+@@ -635,12 +640,34 @@ class MultiDecoder:
+     def live(self) -> int:
+         return len(self.lanes)
+ 
++    def _shard_health(self) -> dict:
++        """TF_GLM_KV_SHARD: each part's rows (free, live streams', kept prompts', twins') and this rank's prompt-chunk
++        fetches (``shard.STATS``)."""
++
++        pool = self.pool
++        parts = []
++        for h in range(pool.parts):
++            xs = [x for x in pool.extents if pool.half_of(x) == h]
++            pin = self._pinned()                 # (room a request can get: free rows and revocable twins, per segment)
++            segs, room = pool.segments(h, pin), pool.segment_free(h, pin)
++            for x in xs:
++                i = pool.segment_of(segs, x.base)
++                if i >= 0 and x.twin:
++                    room[i] += x.size
++            parts.append({"free": pool.free_rows(h), "gatherable": max(room, default=0),
++                          "live_rows": sum(x.size for x in xs if x.owner is not None),
++                          "kept_rows": sum(x.size for x in xs if x.owner is None and not x.twin),
++                          "twin_rows": sum(x.size for x in xs if x.twin), "live": pool.live(h)})
++        return {"parts": parts, "fetch": dict(shard.STATS), "refused_no_part": self.no_part}
++
+     def health(self) -> dict:
+         lanes = list(self.lanes.values())
+         return {"streams": {"decoding": sum(l.decoding and not l.paused for l in lanes),
                              "filling": sum(not l.decoding for l in lanes),
                              "paused": sum(l.decoding and l.paused for l in lanes)},
                  "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
 +                "kv_shard_twins": dict(self.twins, held=sum(1 for l in lanes if l.twin is not None)),
++                "kv_shard": self._shard_health() if self.pool.half else None,
                  "kept_prompts": len(self.kept),
                  # streams that continued their conversation without resuming from its own turn state (a rewind before
                  # its kept states, or they were dropped or read back from disk), and the tokens those prefilled
-@@ -908,7 +913,7 @@ class MultiDecoder:
+@@ -841,13 +868,29 @@ class MultiDecoder:
+ 
+     def fits(self, s: Stream) -> bool:
+         """Whether ``s`` can be placed now (else it waits, in order, for streams to finish): the free rows and the
+-        kept-only extents cover its prompt, with a block of headroom for each decoding stream to grow into."""
++        kept-only extents cover its prompt, with a block of headroom for each decoding stream to grow into. With parts
++        (TF_GLM_KV_SHARD) in one of them, and in one segment of it (the rows between pinned twins: a twin is no room
++        and the extents around it do not pass it). Only the twins ``_room`` cannot give back are pinned here (a fill part
++        way through its layers); the others count as room, since ``_room`` and ``_grow`` revoke them first."""
+ 
+         if not self.lanes:
+             return True                  # everything can be evicted; a prompt past the pool fails in ``admit``
+         need = self._need(len(s.prompt))
+-        room = self.pool.free_rows() + sum(x.size for x in self.pool.extents if x.owner is None)
+-        return room >= need + ALIGN * sum(l.decoding for l in self.lanes.values())
++        pool, pin = self.pool, self._pinned()
++        for h in range(pool.parts) if pool.half else [None]:
++            segs = pool.segments(h, pin)
++            room, busy = pool.segment_free(h, pin), [0] * len(segs)
++            for x in pool.extents:
++                i = pool.segment_of(segs, x.base)
++                if i >= 0 and x.owner is None:           # (kept prompts and revocable twins; a pinned twin is in no segment)
++                    room[i] += x.size
++            for l in self.lanes.values():
++                i = pool.segment_of(segs, l.extent.base)
++                if i >= 0 and l.decoding:
++                    busy[i] += 1
++            if any(r >= need + ALIGN * b for r, b in zip(room, busy)):
++                return True
++        return False
+ 
+     def admit(self, s: Stream) -> None:
+         """Rank 0: place a request (slot, extent; resumed from the longest kept prefix of its prompt when it drafts)
+@@ -908,7 +951,7 @@ class MultiDecoder:
              # the writer's whole extent there, the shared state included.
              others = [c for c in x.kept if len(c.ids) > len(hit.ids) and key[:len(c.ids)] != c.key]
              if others and not self.tune.lone:
@@ -412,7 +520,7 @@ index 33dc834..ccca627 100644
                  copy = int(base is not None)
              if base is None:
                  for c in others:
-@@ -918,7 +923,8 @@ class MultiDecoder:
+@@ -918,7 +961,8 @@ class MultiDecoder:
                  else:
                      hit = None
          if base is None:
@@ -422,7 +530,7 @@ index 33dc834..ccca627 100644
              if base is None and hit is not None:          # no room beside the kept rows: start fresh
                  hit = None
                  base = self._room(need)
-@@ -1058,6 +1064,24 @@ class MultiDecoder:
+@@ -1058,6 +1102,25 @@ class MultiDecoder:
  
          own = f"{self.boot}-{a['sid']}"
          lane.lineage = fork(hit.lineage, own, cut) if getattr(hit, "lineage", "") else own
@@ -434,11 +542,12 @@ index 33dc834..ccca627 100644
 +                tb = self.pool.place(x.size, half=p)
 +                if tb is None:
 +                    break
-+                twins.append(self.pool.add(tb, x.size))
++                twins.append(self.pool.add(tb, x.size, twin=True))
 +            if len(twins) == self.pool.parts - 1:
 +                lane.twin = twins
 +                mine = [t for t in twins if self.pool.half_of(t) == shard.RANK]
 +                st.twin_base = mine[0].base if mine else twins[0].base     # (the owner: only a flag)
++                st.twin_size = x.size
 +                st.bind(x.base, x.size)
 +                self.twins["made"] += 1
 +            else:
@@ -447,7 +556,24 @@ index 33dc834..ccca627 100644
          if a.get("keyed") is not None:              # rank 1 too: its kept states are stored and matched by them
              lane.key = a["keyed"]
          self.next_sid = max(self.next_sid, a["sid"] + 1)
-@@ -1418,7 +1442,8 @@ class MultiDecoder:
+@@ -1320,12 +1383,14 @@ class MultiDecoder:
+         drafter = getattr(self.g, "drafter", None)
+         model = os.path.basename(str(getattr(self.g, "model_dir", "")).rstrip("/"))
+         # what the stored bits depend on: build and runtime, drafter, KV and dense formats, TP layout, plane shapes,
+-        # grid, and the settings every rank agreed at start
++        # grid, and the settings every rank agreed at start; TF_GLM_KV_SHARD's points hold a rank's part of the
++        # latents, another layout than an unsharded run's (it would read them as corrupt and drop them), so a store
++        # of their own (appended only when on: an unsharded run keeps its store)
+         signature = "|".join(["multi", build_id(self.g.model_dir, self.g.drafter_dir),
+                               "" if drafter is None else type(drafter).__name__,
+                               os.environ.get("TF_GLM_KV", ""), os.environ.get("TF_GLM_DENSE", ""),
+                               f"tp{self.w.world}", repr(planes), str(self.grid), str(self.drafts is not None),
+-                              repr(self.g.agreed)])
++                              repr(self.g.agreed)] + ([f"kvshard{self.pool.parts}"] if shard.ON else []))
+         self.loads: dict = {}                  # load id -> a stored prompt being read into a new extent
+         self.next_lid = 0
+         self.load_budget = float(os.environ.get("TF_GLM_SPILL_LOAD_MS") or LOAD_MS_DEFAULT) / 1000.0
+@@ -1418,7 +1483,8 @@ class MultiDecoder:
          try:
              self.disk.persist(self._ident(c), c, extent=c.extent, lineage=c.lineage,
                                tokens=c.ids if c.images else None, shared=bool(c.shared), head=c.head is not None,
@@ -457,7 +583,7 @@ index 33dc834..ccca627 100644
          except Exception as exc:                 # noqa: BLE001  (a spill never fails the engine)
              print(f"[tensorfold] spill rank {self.rank}: not written: {exc!r}", flush=True)
              self.disk.unwritten("failed")
-@@ -1473,7 +1498,12 @@ class MultiDecoder:
+@@ -1473,7 +1539,13 @@ class MultiDecoder:
              self.disk.stats["has_refused"] += 1          # a rank lacks it (lost, damaged, evicted there)
              return None
          size = align_up(pt.n)
@@ -465,13 +591,23 @@ index 33dc834..ccca627 100644
 +        half = None
 +        if self.pool.half:                       # TF_GLM_KV_SHARD: back into the half whose rank holds its latents
 +            half = (pt.fields or {}).get("half")
-+            if half is None:
++            if half is None:                     # (a point an unsharded run wrote: counted, never silent)
++                self.disk.stats["refused_half"] = self.disk.stats.get("refused_half", 0) + 1
 +                return None
 +        base = self._room(size, [hit.extent] if hit is not None else [], half=half)
          if base is None:
              self._sync()
              return None
-@@ -1669,22 +1699,84 @@ class MultiDecoder:
+@@ -1661,6 +1733,8 @@ class MultiDecoder:
+         """Both ranks: relocate extent x (its used rows copied) to [base, base + size). A stored prompt being read into
+         it goes on: its next blocks land at the new base, after the rows' copy (``BlockStore.moving``)."""
+ 
++        if x.twin:                   # a twin's rows are where its filling prompt's state reads them: never moved
++            raise RuntimeError(f"extent {x.eid} is a twin of a filling prompt: it is pinned, not moved")
+         used = self._used(x)
+         h = getattr(x, "loading", None)
+         with self.disk.moving(h.lj) if h is not None and h.lj is not None else contextlib.nullcontext():
+@@ -1669,55 +1743,166 @@ class MultiDecoder:
          if x.owner is not None:
              self.lanes[x.owner].st.bind(x.base, x.size)
  
@@ -479,16 +615,30 @@ index 33dc834..ccca627 100644
 +        """Both ranks: the lane's twin rows back to the pool; its prompt fills on as sharded (the owner holds every row
 +        the twin did)."""
 +
++        if lane.twin is None:
++            raise RuntimeError(f"rank {self.rank}: stream {lane.sid} has no twin to give back")
 +        for t in lane.twin:
 +            self.pool.remove(t)
 +        lane.twin = None
-+        lane.st.twin_base = None
++        lane.st.twin_base = lane.st.twin_size = None
 +        lane.st.bind(lane.extent.base, lane.extent.size)
 +
-+    def _revoke_twins(self, half: int | None) -> bool:
-+        """Rank 0: every twin in ``half`` (None: both) given back before rows there are made by evicting or moving."""
++    def _pinned(self):
++        """Which extents ``_revoke_twins`` cannot give back now: the twins of the fill part way through its layers
++        (a predicate on extents, for ``Pool.segments``)."""
 +
-+        pending = self.partial                   # (a fill part way through its layers keeps its rows to the end)
++        pending = self.partial
++        held = {id(t) for l in self.lanes.values() if l.twin is not None and pending is not None
++                and pending.contains(l.sid) for t in l.twin}
++        return lambda x: id(x) in held
++
++    def _revoke_twins(self, half: int | None) -> bool:
++        """Rank 0: every twin in ``half`` (None: all) given back before rows there are made by evicting or moving.
++        A fill part way through its layers keeps its twin to the end (its remaining layers would read a different
++        binding than the first ones wrote; no byte-equality run covers that yet): the twin is pinned meanwhile, so
++        the extents around it move and it does not (``Extent.twin``, ``_compact``)."""
++
++        pending = self.partial
 +        lanes = [l for l in self.lanes.values() if l.twin is not None and
 +                 (half is None or any(self.pool.half_of(t) == half for t in l.twin)) and
 +                 (pending is None or not pending.contains(l.sid))]
@@ -516,10 +666,11 @@ index 33dc834..ccca627 100644
 +    def _eviction_cost(self, need: int, protect, half: int):
 +        """Rank 0, with halves: evicting the least recently used kept prompts of ``half`` until it has ``need`` free
 +        rows, the place in the kept order (the recency) of the newest one that takes: -1 when none is needed, None
-+        when even all of them leave too little. An extent's rows come free as ``_settle`` frees them."""
++        when even all of them leave too little. An extent's rows come free as ``_settle`` frees them, in its segment
++        (the rows between pinned twins: compaction gathers no further)."""
 +
-+        free = self.pool.free_rows(half)
-+        if free >= need:
++        segs, free = self.pool.segments(half), self.pool.segment_free(half)
++        if max(free, default=0) >= need:
 +            return -1
 +        left = {id(x): list(x.kept) for x in self.pool.extents}
 +        size = {id(x): x.size for x in self.pool.extents}
@@ -529,9 +680,11 @@ index 33dc834..ccca627 100644
 +                continue
 +            ks = left[id(x)] = [k for k in left[id(x)] if k is not c]
 +            new = min(size[id(x)], align_up(max(len(k.ids) for k in ks))) if ks else 0
-+            free += size[id(x)] - new
++            i = self.pool.segment_of(segs, x.base)
++            assert i >= 0, f"kept extent {x.eid} at {x.base} lies in no segment (inside a twin?)"
++            free[i] += size[id(x)] - new
 +            size[id(x)] = new
-+            if free >= need:
++            if max(free) >= need:
 +                return i
 +        return None
 +
@@ -547,9 +700,12 @@ index 33dc834..ccca627 100644
          """Rank 0: slide every extent down to the lowest free rows (MOVEs), so the free rows are one range; with
          ``grow``, only the extents up to it slide down and the ones after it up to the pool's end, so that range
 -        follows ``grow`` (each extent moves once at most)."""
-+        follows ``grow`` (each extent moves once at most). With halves (TF_GLM_KV_SHARD): within ``half`` (grow's)."""
- 
+-
 -        at = 0
++        follows ``grow`` (each extent moves once at most). With halves (TF_GLM_KV_SHARD): within ``half`` (grow's),
++        around the pinned twins (a filling prompt's borrowed rows): they stay where they are, and what slides stays
++        on its side of each, so a segment's free rows are what gathers."""
++
 +        if grow is not None and self.pool.half:
 +            half = self.pool.half_of(grow)
 +        lo = half * self.pool.half if half is not None and self.pool.half else 0
@@ -560,8 +716,12 @@ index 33dc834..ccca627 100644
 +                continue
              if grow is not None and x.base > grow.base:
                  break
++            if x.twin:
++                at = x.end
++                continue
              if x.base != at:
-@@ -1693,8 +1785,10 @@ class MultiDecoder:
+                 self._emit(MOVE, [x.eid, at, x.size])
+                 self._move(x, at, x.size)
              at += x.size
          if grow is None:
              return
@@ -572,20 +732,23 @@ index 33dc834..ccca627 100644
 +                continue
              if x is grow:
                  break
++            if x.twin:
++                top = x.base
++                continue
              top -= x.size
-@@ -1702,22 +1796,38 @@ class MultiDecoder:
+             if x.base != top:
                  self._emit(MOVE, [x.eid, top, x.size])
                  self._move(x, top, x.size)
  
 -    def _room(self, need: int, protect=()) -> int | None:
 +    def _gathered(self, need: int, half: int | None):
-+        """Rank 0: where ``need`` free rows exist, just not together: None (the pool), a half (``half``, or either,
-+        with halves), or False."""
++        """Rank 0: where ``need`` free rows exist, just not together, and compacting gathers them (around pinned
++        twins): None (the pool), a half (``half``, or either, with halves), or False."""
 +
 +        if not self.pool.half:
-+            return None if self.pool.free_rows() >= need else False
++            return None if self.pool.compactable() >= need else False
 +        for h in ([half] if half is not None else range(self.pool.parts)):
-+            if self.pool.free_rows(h) >= need:
++            if self.pool.compactable(h) >= need:
 +                return h
 +        return False
 +
@@ -593,14 +756,22 @@ index 33dc834..ccca627 100644
          """Rank 0: a base with ``need`` free rows, evicting kept prompts (least recently used first, never
          ``protect``'s extents) only while the free rows fall short of ``need``, then compacting if they are not
          together: moving rows costs far less than prefilling an evicted conversation again. None if even evicting
-         every other kept prompt leaves too little."""
- 
+-        every other kept prompt leaves too little."""
+-
 -        base = self.pool.place(need)
++        every other kept prompt leaves too little (with halves: in any part, in which case none is evicted)."""
++
 +        base = self.pool.place(need, half=half)
 +        if base is None and self.pool.half and self._revoke_twins(half):
 +            base = self.pool.place(need, half=half)
-+        if base is None and half is None and self.pool.half and self._gathered(need, None) is False:
-+            half = self._cheaper_half(need, protect)      # evict in one half only, the one losing the oldest states
++        if base is None and self.pool.half and self._gathered(need, half) is False:
++            if half is None:
++                half = self._cheaper_half(need, protect)  # evict in one half only, the one losing the oldest states
++            elif self._eviction_cost(need, protect, half) is None:
++                half = None
++            if half is None:
++                self.no_part += 1
++                return None                               # no part can make the room: evicting would only lose states
          while base is None:
 -            if self.pool.free_rows() >= need:
 -                self._compact()
@@ -619,7 +790,7 @@ index 33dc834..ccca627 100644
          return base
  
      def _grow(self, x, size: int, protect=()) -> bool:
-@@ -1733,15 +1843,18 @@ class MultiDecoder:
+@@ -1733,15 +1918,18 @@ class MultiDecoder:
                  self._emit(GROW, [x.eid, size])
                  self._resize(x, size)
                  return True
@@ -633,7 +804,7 @@ index 33dc834..ccca627 100644
                  self._move(x, base, size)
                  return True
 -            if self.pool.free_rows() + x.size >= size:
-+            if self.pool.free_rows(hx) + x.size >= size:
++            if self.pool.segment_room(x) + x.size >= size:
                  self._compact(grow=x)            # the rows are free, just not together: gathered right after x
                  continue
 -            victims = self._victims(protect)
@@ -641,7 +812,7 @@ index 33dc834..ccca627 100644
              if not victims:
                  return False
              self._evict(victims[0])
-@@ -2066,6 +2179,8 @@ class MultiDecoder:
+@@ -2066,6 +2254,8 @@ class MultiDecoder:
  
          from .copy_drafts import CopyDrafts
  
@@ -650,7 +821,7 @@ index 33dc834..ccca627 100644
          s = lane.s
          prompt = s.prompt
          lane.decoding = True
-@@ -2355,6 +2470,8 @@ class MultiDecoder:
+@@ -2355,6 +2545,8 @@ class MultiDecoder:
              for retired in pending.retired - {sid}:
                  self._finish(retired)
          lane = self.lanes.pop(sid)
@@ -659,12 +830,16 @@ index 33dc834..ccca627 100644
          x = lane.extent
          x.owner = None
          self._settle(x)
-@@ -2463,6 +2580,8 @@ class MultiDecoder:
+@@ -2463,6 +2655,12 @@ class MultiDecoder:
                  self._move(self.pool.get(p[0]), p[1], p[2])
              elif op == GROW:
                  self._resize(self.pool.get(p[0]), p[1])
 +            elif op == UNTWIN:
-+                self._untwin(self.lanes[p[0]])
++                lane = self.lanes.get(p[0])
++                if lane is None or lane.twin is None:
++                    raise RuntimeError(f"rank {self.rank}: UNTWIN of stream {p[0]}, which "
++                                       + ("is not live" if lane is None else "has no twin"))
++                self._untwin(lane)
              elif op == FILL:
                  lane = self.lanes[p[0]]
                  if p[1] != self._stop_bound(lane, p[1]):
@@ -693,7 +868,7 @@ index 474753d..be1112e 100644
              return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))
  
 diff --git tensorfold/families/glm5_next/cuda/pool.py tensorfold/families/glm5_next/cuda/pool.py
-index 2f39307..475c0e1 100644
+index 2f39307..51e0f53 100644
 --- tensorfold/families/glm5_next/cuda/pool.py
 +++ tensorfold/families/glm5_next/cuda/pool.py
 @@ -33,13 +33,20 @@ class Plane:
@@ -749,7 +924,25 @@ index 2f39307..475c0e1 100644
              a, b = src // p.div, dst // p.div
              m = -(-n // p.div)
              m = min(m, p.tensor.shape[0] - max(a, b))
-@@ -128,10 +150,16 @@ class Pool:
+@@ -108,13 +130,16 @@ def _move(t, a: int, b: int, m: int, spanned: bool = False) -> None:
+ @dataclass(eq=False)
+ class Extent:
+     """Pool rows [base, base + size). ``owner``: the live stream writing into it (its sid), or None; ``kept``: the
+-    kept prompts whose rows it holds (each a prefix of the rows)."""
++    kept prompts whose rows it holds (each a prefix of the rows). ``twin`` (TF_GLM_KV_SHARD): rows a filling prompt
++    borrows in a part that is not its own, written by that part's rank. It has no owner and keeps no prompt, but its
++    rows are live and the prompt's state points at them, so it is pinned: it never moves and never counts as room."""
+ 
+     base: int
+     size: int
+     eid: int = 0
+     owner: int | None = None
+     kept: list = field(default_factory=list)
++    twin: bool = False
+ 
+     @property
+     def end(self) -> int:
+@@ -128,10 +153,16 @@ class Pool:
      """Extents over ``rows`` pool rows, host side only. Placement is lowest base first; every call is deterministic
      in the calls before it, so two ranks making the same calls hold the same extents."""
  
@@ -767,7 +960,7 @@ index 2f39307..475c0e1 100644
          self.extents: list[Extent] = []           # by base
          self.next_id = 0
  
-@@ -149,24 +177,57 @@ class Pool:
+@@ -149,24 +180,108 @@ class Pool:
              at = max(at, x.end)
          if at < self.rows:
              out.append((at, self.rows - at))
@@ -826,6 +1019,57 @@ index 2f39307..475c0e1 100644
 +                    return base
          return None
  
++    def segments(self, half: int | None = None, pinned=None) -> list[tuple[int, int]]:
++        """The ranges of ``half`` (None: the pool) between its pinned twin extents, [lo, hi) by base: what compaction
++        slides extents down within (a twin never moves, so no extent passes one that way). ``pinned``: which extents
++        are (default: every twin; a caller that will give back the twins it can first passes the ones it cannot)."""
++
++        pin = pinned or (lambda x: x.twin)
++        lo, hi = (half * self.half, (half + 1) * self.half) if half is not None and self.half else (0, self.rows)
++        out, at = [], lo
++        for x in self.extents:
++            if pin(x) and lo <= x.base < hi:
++                if x.base > at:
++                    out.append((at, x.base))
++                at = x.end
++        if at < hi:
++            out.append((at, hi))
++        return out
++
++    @staticmethod
++    def segment_of(segments: list[tuple[int, int]], base: int) -> int:
++        """The index in ``segments`` of the one holding pool row ``base`` (-1: none: a twin's, or another part's)."""
++
++        for i, (lo, hi) in enumerate(segments):
++            if lo <= base < hi:
++                return i
++        return -1
++
++    def segment_free(self, half: int | None = None, pinned=None) -> list[int]:
++        """The free rows of each of ``segments(half)``: what compacting gathers there into one range."""
++
++        segs = self.segments(half, pinned)
++        free = [hi - lo for lo, hi in segs]
++        for x in self.extents:
++            i = self.segment_of(segs, x.base)
++            if i >= 0:
++                free[i] -= x.size
++        return free
++
++    def compactable(self, half: int | None = None, pinned=None) -> int:
++        """The longest range of free rows ``half`` (None: the pool) can gather by compacting around its pinned twins:
++        the most free rows of any one segment (without twins, all the free rows of the half)."""
++
++        return max(self.segment_free(half, pinned), default=0)
++
++    def segment_room(self, x: Extent) -> int:
++        """The free rows of the segment ``x`` lies in: what ``x`` can grow by once compaction has gathered them after
++        it."""
++
++        half = self.half_of(x) if self.half else None
++        i = self.segment_of(self.segments(half), x.base)
++        return self.segment_free(half)[i] if i >= 0 else 0
++
      def room_after(self, x: Extent) -> int:
          """Free rows right after x (before the next extent or the pool's end)."""
  
@@ -836,16 +1080,35 @@ index 2f39307..475c0e1 100644
          return nxt - x.end
  
      def get(self, eid: int) -> Extent:
-@@ -184,6 +245,8 @@ class Pool:
+@@ -176,15 +291,18 @@ class Pool:
+         raise KeyError(f"no extent {eid}")
+ 
+     # -- changes -------------------------------------------------------------------------------------------------
+-    def add(self, base: int, size: int) -> Extent:
+-        """A new extent at exactly [base, base + size) (rank 0's placement, applied on both ranks)."""
++    def add(self, base: int, size: int, twin: bool = False) -> Extent:
++        """A new extent at exactly [base, base + size) (rank 0's placement, applied on both ranks); ``twin``: a
++        filling prompt's borrowed rows (``Extent.twin``)."""
+ 
+         size = align_up(size, self.align)
+         if base % self.align or base < 0 or base + size > self.rows:
              raise ValueError(f"extent [{base}, {base + size}) is not an aligned range of the {self.rows}-row pool")
          if any(x.base < base + size and base < x.end for x in self.extents):
              raise ValueError(f"extent [{base}, {base + size}) overlaps another")
+-        x = Extent(base, size, self.next_id)
 +        if self.half and self.half_of(base) != self.half_of(base + size - 1):
 +            raise ValueError(f"extent [{base}, {base + size}) crosses the pool's halves")
-         x = Extent(base, size, self.next_id)
++        x = Extent(base, size, self.next_id, twin=bool(twin))
          self.next_id += 1
          self.extents.append(x)
-@@ -213,6 +276,9 @@ class Pool:
+         self.extents.sort(key=lambda y: y.base)
+@@ -209,10 +327,15 @@ class Pool:
+         base."""
+ 
+         size = x.size if size is None else align_up(size, self.align)
++        if x.twin:
++            raise ValueError(f"extent {x.eid} is a twin: its rows are pinned, a filling prompt reads them in place")
+         if base % self.align or base < 0 or base + size > self.rows:
              raise ValueError(f"extent [{base}, {base + size}) is not an aligned range of the pool")
          if any(y is not x and y.base < base + size and base < y.end for y in self.extents):
              raise ValueError(f"extent {x.eid} cannot move to [{base}, {base + size}): taken")
@@ -856,7 +1119,7 @@ index 2f39307..475c0e1 100644
          x.base, x.size = base, size
          self.extents.sort(key=lambda y: y.base)
 diff --git tensorfold/families/glm5_next/cuda/segments.py tensorfold/families/glm5_next/cuda/segments.py
-index b8361aa..68ed457 100644
+index b8361aa..afea97e 100644
 --- tensorfold/families/glm5_next/cuda/segments.py
 +++ tensorfold/families/glm5_next/cuda/segments.py
 @@ -55,7 +55,7 @@ class SegRows:
@@ -882,7 +1145,7 @@ index b8361aa..68ed457 100644
          self.staged = torch.cuda.Event() if pin else None
          self.R = 0
          self.segments: list[tuple[int, int, int]] = []
-@@ -78,7 +85,11 @@ class SegRows:
+@@ -78,7 +85,13 @@ class SegRows:
          if R > self.rows:
              raise ValueError(f"a window of {R} rows, the tables hold {self.rows}")
          rows, S = self.rows, self.max_segs
@@ -891,11 +1154,13 @@ index b8361aa..68ed457 100644
 +        from . import shard
 +
 +        sharded = shard.ON and shard.HALF > 0
++        if sharded and R > shard.TRASH:          # (a row it does not own writes to its own trash row: the window's index)
++            raise ValueError(f"a window of {R} rows, the sharded latent planes keep {shard.TRASH} trash rows")
 +        o2 = 5 * rows + 4 * S
          r = 0
          for s, seg in enumerate(segments):
              base, pos, n = seg[:3]
-@@ -99,6 +110,12 @@ class SegRows:
+@@ -99,6 +112,12 @@ class SegRows:
                  t[2 * rows + r + i] = s
                  t[3 * rows + r + i] = int(sparse_from is not None and q >= sparse_from)
                  t[4 * rows + r + i] = ibase
@@ -910,10 +1175,10 @@ index b8361aa..68ed457 100644
              t[o + s] = r
 diff --git tensorfold/families/glm5_next/cuda/shard.py tensorfold/families/glm5_next/cuda/shard.py
 new file mode 100644
-index 0000000..1776e3a
+index 0000000..093cbdb
 --- /dev/null
 +++ tensorfold/families/glm5_next/cuda/shard.py
-@@ -0,0 +1,346 @@
+@@ -0,0 +1,457 @@
 +"""TF_GLM_KV_SHARD=1 (two ranks or more, --parallel above 1): the latent cache stored once instead of on every rank.
 +
 +The pool's rows are split in parts, one a rank (two halves at two ranks): an extent lives in one part
@@ -935,14 +1200,16 @@ index 0000000..1776e3a
 +every other rank writes its own copy of the prompt's latents into free rows of its part (twin extents, one a part,
 +all or none, placed the same way on every rank when the stream is admitted), so both attend locally as unsharded and nothing is sent; the twin
 +goes when the prompt is in (before the first decode round), when the stream ends, or as soon as rank 0 needs its rows
-+for anything else (UNTWIN). Only rows nobody holds are borrowed: a twin never evicts a kept prompt.
++for anything else (UNTWIN), unless the fill is part way through its layers (its remaining layers read the binding its
++first ones wrote): that twin is pinned, never moved (the prompt's state points at its rows) and never counted as room,
++and compaction goes around it. Only rows nobody holds are borrowed: a twin never evicts a kept prompt.
 +
 +The spill tier stores what each rank holds: an extent's owner its latent and pooled-key rows, the other rank its
 +pooled keys (and each its own small state); a point records its half, and a restore goes back into it.
 +
 +With the display reservation (TF_GLM_DISPLAY_KV_MIB) the first latent planes, each a half and its trash rows long, are
 +carved from its span as unsharded (the pool's rows count its bytes at a sharded token's cost). Not with
-+TF_GLM_MULTI_LONE, or one rank. Past two ranks (TP3, TP4) the decode all-to-all and the prompt broadcast are untested
++TF_GLM_MULTI_LONE, TF_GLM_MULTI_VERIFY=serial, or one rank (all refused at start). Past two ranks (TP3, TP4) the decode all-to-all and the prompt broadcast are untested
 +on hardware here (two Sparks): the CPU checks cover the pool's parts, placement and twins."""
 +
 +from __future__ import annotations
@@ -963,6 +1230,8 @@ index 0000000..1776e3a
 +HALF = 0                          # pool rows a part, one a rank: a half at two ranks (latent rows a rank: HALF + TRASH)
 +HEADS: list = []                  # every rank's attention heads (22/21/21 at three ranks)
 +ROW = 0                           # bytes of a latent row (set with the caches)
++DTYPE = torch.uint8               # the latent planes' type (set with the caches): a fetched copy is viewed as it
++STATS = {"fetches": 0, "identity": 0, "rows": 0, "bytes": 0}     # this rank's prompt-chunk fetches (/health)
 +_buf: dict = {}
 +
 +
@@ -995,18 +1264,88 @@ index 0000000..1776e3a
 +    return int(base) - RANK * HALF
 +
 +
-+def sizes(pool_rows: int, dsa: int, kv: str, capacity: int, world: int = 2) -> int:
++def budget(pool_rows: int, dsa: int, kv: str, world: int = 2) -> int:
 +    """The sharded pool's rows for the memory ``pool_rows`` unsharded rows of ``dsa`` latent planes and pooled-key
 +    planes take: each token's latent once over the ``world`` ranks, its pooled keys on every one, ``TRASH`` latent
-+    rows a rank. At least ``world`` parts of ``capacity`` (one stream's window fits in a part)."""
++    rows a rank (whole parts of extents; 0 when the memory does not hold the trash rows)."""
 +
 +    from . import kv8
 +
 +    align = world * 2048
 +    lat, pk = kv8.row_bytes(512, kv), kv8.row_bytes(128, kv) / 4
-+    budget = pool_rows * dsa * (lat + pk)
-+    rows = int((budget - TRASH * dsa * lat) // (dsa * (lat / world + pk))) // align * align
-+    return max(rows, world * (-(-capacity // align) * align))
++    mem = pool_rows * dsa * (lat + pk)
++    return max(0, int((mem - TRASH * dsa * lat) // (dsa * (lat / world + pk))) // align * align)
++
++
++def floor(capacity: int, world: int = 2) -> int:
++    """The fewest rows of a sharded pool whose parts each hold one stream's window (``capacity`` tokens)."""
++
++    align = world * 2048
++    return world * (-(-capacity // align) * align)
++
++
++def sizes(pool_rows: int, dsa: int, kv: str, capacity: int, world: int = 2) -> int:
++    """``budget``, at least ``floor`` (the rows past the memory then are the caller's to account for: ``plan`` is the
++    start-up's, which shrinks the window to a part instead)."""
++
++    return max(budget(pool_rows, dsa, kv, world), floor(capacity, world))
++
++
++MIN_PART = 131072                 # tokens: a part smaller than this (or than a quarter of the window) is refused
++
++
++def plan(pool_rows: int, dsa: int, kv: str, limit: int, world: int, max_rows: int) -> tuple[int, str]:
++    """The start-up's sharded pool: (rows, a note for the log or ""). The memory ``pool_rows`` unsharded rows take
++    holds ``budget`` sharded ones, never more. A stream lives in one part, so a part smaller than the requested window
++    (``limit`` tokens) shortens what a request may use to what a part holds (``part - max_rows``: the engine's limit,
++    which admit and ``generate`` already cite): the note says so, with the numbers. That happens by a few thousand
++    tokens when the memory read at start is a little low (a first start that compiles extensions just before). A part
++    below ``MIN_PART`` (131,072: the smallest window the recipe suggests) or a quarter of the window is refused, since
++    the server would then serve a fraction of what was asked."""
++
++    rows = budget(pool_rows, dsa, kv, world)
++    part = rows // world
++    effective = min(int(limit), part - int(max_rows))
++    if effective >= limit:
++        return rows, ""
++    if effective < 1 or part < max(MIN_PART, int(limit) // 4):
++        raise ValueError(f"TF_GLM_KV_SHARD=1: the memory of a {pool_rows}-token pool holds {rows} sharded tokens "
++                         f"({part} a part at {world} ranks), too little for the requested {limit}-token window "
++                         f"(a part must hold at least {max(MIN_PART, int(limit) // 4)}): lower --context, or free "
++                         f"memory")
++    return rows, (f"a part holds {part} tokens, less than the requested {limit}-token window: a request may use up to "
++                  f"{effective} tokens ({max_rows} rows of a part are a decode window's)")
++
++
++def unsupported(verify: str) -> str | None:
++    """Why the shard cannot run with TF_GLM_MULTI_VERIFY=``verify`` (None: it can)."""
++
++    if verify == "serial":
++        return ("TF_GLM_KV_SHARD=1 does not run with TF_GLM_MULTI_VERIFY=serial: the one-stream graphs it replays are "
++                "captured with the rank that does not own the rows attending nothing (the owner computes every head), "
++                "so their tokens would be wrong; use the batched verify")
++    return None
++
++
++def as_bytes(lc):
++    """A latent plane's rows as bytes [rows, row bytes] (None: this rank holds none): rows travel as bytes, whatever
++    the cache's type (a bf16 row is 1,024 of them, an FP8 row 528)."""
++
++    return lc if lc is None or lc.dtype == torch.uint8 else lc.view(torch.uint8)
++
++
++def as_cache(got):
++    """A fetched copy [rows, row bytes] as the latent planes' type, what the attention kernels read."""
++
++    return got if DTYPE == torch.uint8 else got.view(DTYPE)
++
++
++def agree(rows: list) -> tuple[int, int]:
++    """(pool rows, display rows) every rank uses, from what each computed (``rows``: one [pool, display] a rank).
++    Ranks' pools differ by a few extents (each rank's own KDA state size is in the plan), and a part's owner is
++    ``base // HALF``: the ranks must agree on HALF, so all take the smallest."""
++
++    return min(int(r[0]) for r in rows), min(int(r[1]) for r in rows)
 +
 +
 +def _scratch(R: int, H: int, LW: int, device, nch: int):
@@ -1077,17 +1416,16 @@ index 0000000..1776e3a
 +        from . import latent
 +
 +        heads = HEADS or [H] * WORLD
-+        Hm, T = max(heads), sum(heads)
-+        offs = [sum(heads[:r]) for r in range(WORLD)]
-+        peers = [p for p in range(WORLD) if p != RANK]
++        hp = head_plan(heads, RANK)
++        Hm, T = hp.Hm, hp.T
++        send, recv = exchange_buffers(hp, R, LW, device)
 +        b = SimpleNamespace(
-+            heads=heads, Hm=Hm, T=T, offs=offs, peers=peers,
++            heads=heads, Hm=Hm, T=T, offs=hp.offs, peers=hp.peers,
 +            qp=torch.zeros((R, Hm, LW), dtype=torch.bfloat16, device=device),
 +            qg=torch.empty((WORLD * R * Hm * LW,), dtype=torch.bfloat16, device=device),
 +            qall=torch.empty((R, T, LW), dtype=torch.bfloat16, device=device),
 +            oall=torch.empty((R, T, LW), dtype=torch.bfloat16, device=device),
-+            send={p: torch.empty((R, heads[p], LW), dtype=torch.bfloat16, device=device) for p in peers},
-+            recv={p: torch.empty((R, H, LW), dtype=torch.bfloat16, device=device) for p in peers},
++            send=send, recv=recv,
 +            counts=torch.zeros((R,), dtype=torch.int32, device=device),
 +            zero=torch.zeros((R,), dtype=torch.int32, device=device),
 +            notok=torch.full((R, 1), -1, dtype=torch.int32, device=device),
@@ -1119,16 +1457,48 @@ index 0000000..1776e3a
 +    torch.mul(counts[:R], rows.own[:R], out=ce)
 +    view = SimpleNamespace(pos=rows.pos, base=rows.lbase, sparse=rows.sparse_eff)
 +    oall = latent.seg_attention(qall, lc, view, tokens, ce, b.s64, scale=scale, out=b.oall[:R])
-+    sends, recvs = {}, {}
-+    for p in b.peers:
-+        b.send[p][:R].copy_(oall[:, b.offs[p]:b.offs[p] + b.heads[p]])
-+        sends[p], recvs[p] = [b.send[p][:R]], [b.recv[p][:R]]
++    sends, recvs = pack_heads(b, oall, R)
 +    xa = getattr(comm, "exchange_all", None) or getattr(comm, "nccl", comm).exchange_all
 +    xa(sends, recvs)
-+    out.copy_(oall[:, b.offs[RANK]:b.offs[RANK] + H])
-+    owner = rows.orank[:R][:, None, None]
++    return unpack_heads(b, oall, rows.orank[:R], out, R)
++
++
++def head_plan(heads: list, rank: int) -> SimpleNamespace:
++    """Where each rank's heads sit among all of them (``offs``, ``T`` in all), the most any rank has (``Hm``: what a
++    queries' gather and a pair's exchange are padded to) and ``rank``'s peers."""
++
++    return SimpleNamespace(Hm=max(heads), T=sum(heads), offs=[sum(heads[:r]) for r in range(len(heads))],
++                           peers=[p for p in range(len(heads)) if p != rank])
++
++
++def exchange_buffers(hp, R: int, LW: int, device):
++    """A send and a receive a peer, [R, Hm, LW] each: every pair's alike, padded to the most heads a rank has (as the
++    gathered queries are), since ``exchange_all`` refuses unequal sizes and the ranks' heads differ at three."""
++
++    mk = lambda: {p: torch.empty((R, hp.Hm, LW), dtype=torch.bfloat16, device=device) for p in hp.peers}  # noqa: E731
++    return mk(), mk()
++
++
++def pack_heads(b, oall, R: int):
++    """The owner's output ``oall`` [R, all heads, LW] cut for each peer: its heads, padded to ``Hm`` -> the
++    all-to-all's {peer: [send]} and {peer: [receive]} (both [R, Hm, LW], the same size in every pair)."""
++
++    sends, recvs = {}, {}
 +    for p in b.peers:
-+        torch.where(owner == p, b.recv[p][:R], out, out=out)
++        b.send[p][:R, :b.heads[p]].copy_(oall[:, b.offs[p]:b.offs[p] + b.heads[p]])
++        sends[p], recvs[p] = [b.send[p][:R]], [b.recv[p][:R]]
++    return sends, recvs
++
++
++def unpack_heads(b, oall, orank, out, R: int):
++    """This rank's heads of every row: its own pass's for the rows it owns, else the owner's (the receive from rank
++    ``orank[row]``, its first ``out``'s heads of the padding) -> ``out`` [R, heads, LW]."""
++
++    H = out.shape[1]
++    out.copy_(oall[:, b.offs[RANK]:b.offs[RANK] + H])
++    owner = orank[:, None, None]
++    for p in b.peers:
++        torch.where(owner == p, b.recv[p][:R, :H], out, out=out)
 +    return out
 +
 +
@@ -1211,6 +1581,9 @@ index 0000000..1776e3a
 +    from tensorfold.cuda.comm import _DTYPES
 +
 +    n = hist if isinstance(hist, int) else int(hist.numel())
++    STATS["fetches"] += 1
++    STATS["rows"] += n
++    STATS["bytes"] += n * row_bytes
 +    nc = getattr(comm, "nccl", comm)
 +    peer = 1 - RANK
 +    stream = torch.cuda.current_stream().cuda_stream
@@ -1241,6 +1614,9 @@ index 0000000..1776e3a
 +
 +    from tensorfold.cuda.comm import _DTYPES
 +
++    if root is None or int(root) < 0:      # (a caller that names no owner, as the MTP layer's dsa_block, would
++        raise ValueError(                  # broadcast from rank -1)
++            f"TF_GLM_KV_SHARD: a fetch past two ranks needs the rank that owns the rows, not {root}")
 +    f = nc.lib.ncclBroadcast
 +    if f.argtypes is None:
 +        f.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,

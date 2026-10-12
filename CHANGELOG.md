@@ -11,8 +11,9 @@ Every change to this recipe, newest first. Each release names the image it serve
   computes the decode attention of its rows; a prompt chunk on the other Sparks gets only the history rows its sparse
   attention selects, or borrows free rows and attends locally. Two Sparks, `PARALLEL=8`: the pool holds 1.87x the tokens
   (1.51M -> 2.83M; 1.85M -> 3.47M with `DISPLAY_KV_MIB=1792`), every reply byte-equal to the unsharded engine's, decode
-  within 1%, prompts within noise when rows can be borrowed and +1.8-3.5% when they are sent. Builds on `0110` and
-  `0111`. CPU check: `tools/kv_shard_check.py`.
+  within 1%, prompts within noise when rows can be borrowed and +1.8-3.5% when they are sent. A borrowed row is pinned
+  while its prompt fills (a compaction moving it gave wrong replies under concurrent load; found in review, fixed, and
+  a forced-compaction run on two Sparks is byte-equal). Builds on `0110` and `0111`. CPU check: `tools/kv_shard_check.py`.
 
 - **A rewound conversation keeps its id** (patch `0111-glm-chat-continued`, by [wojo](https://github.com/wojo)): patch
   `0089` gave a stream a new conversation id unless it resumed from one of that conversation's own turn states, so a
