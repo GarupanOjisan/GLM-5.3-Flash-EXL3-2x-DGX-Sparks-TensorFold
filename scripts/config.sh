@@ -419,9 +419,10 @@ SPILL_HIGHWATER="${SPILL_HIGHWATER:-0.70}"
 SPILL_MIN_TOKENS="${SPILL_MIN_TOKENS:-8192}"
 SPILL_MIN_FREE_GIB="${SPILL_MIN_FREE_GIB:-50}"
 SPILL_FLUSH_S="${SPILL_FLUSH_S:-60}"
-SPILL_QUOTA="${SPILL_QUOTA:-0}"
+# (each also taken from its TF_GLM_ name when only that is set: exporting the TF_GLM_ name alone was overwritten)
+SPILL_QUOTA="${SPILL_QUOTA:-${TF_GLM_SPILL_QUOTA:-0}}"
 export TF_GLM_SPILL_QUOTA="$SPILL_QUOTA"
-SPILL_TURNS="${SPILL_TURNS:-4}"
+SPILL_TURNS="${SPILL_TURNS:-${TF_GLM_SPILL_TURNS:-4}}"
 export TF_GLM_SPILL_TURNS="$SPILL_TURNS"
 # A request whose prompt starts with what another request is still prefilling (a system prompt several agents share)
 # waits for that state instead of prefilling it beside it (patch 0110): six agents at once on a fresh 12k-token system
