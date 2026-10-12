@@ -457,21 +457,29 @@ def bf16_bytes():
 section("9 bf16", bf16_bytes)
 
 def floor_budget():
-    cap = 1_048_576
-    # --context 0: the memory holds about the window; the floor (world windows) is above what the budget pays for
-    unsh = 1_060_864
-    for N in (2, 3, 4):
+    # the window a request may use is what a part holds (limit = part - max_rows, the engine's own cap), noted not refused
+    # unless a part would be absurdly small
+    cap = lim = 1_048_576
+    for N, unsh in ((2, 1_118_208), (2, 1_060_864), (3, 1_060_864), (4, 1_060_864)):
         have = shard.budget(unsh, 11, "fp8", N)
-        want = shard.floor(cap, N)
-        try:
-            shard.plan(unsh, 11, "fp8", cap, N, True); refused = False
-        except ValueError as exc:
-            refused = "lower --context" in str(exc) and str(have) in str(exc)
-        rows, note = shard.plan(unsh, 11, "fp8", cap, N, False)
-        check(f"9 floor N={N}: an explicit context above the budget is refused with the numbers; auto stays inside the budget "
-              f"({have} < {want})", have < want and refused and rows == have and rows <= shard.budget(unsh, 11, "fp8", N) and bool(note))
-    rows, note = shard.plan(4_000_000, 11, "fp8", cap, 2, True)
+        part = have // N
+        rows, note = shard.plan(unsh, 11, "fp8", lim, N, 16)
+        want = f"up to {min(lim, part - 16)} tokens"
+        check(f"9 floor N={N} pool {unsh}: a part of {part} short of the {lim} window: shrink, one note with the numbers, "
+              f"never past the budget", rows == have and rows <= shard.budget(unsh, 11, "fp8", N) and part - 16 < lim
+              and want in note and str(part) in note and str(lim) in note and "\n" not in note)
+    rows, note = shard.plan(4_000_000, 11, "fp8", lim, 2, 16)
     check("9 floor: a budget that holds the windows is untouched", rows == shard.budget(4_000_000, 11, "fp8", 2) and not note)
+    for N, unsh, what in ((2, 100_000, "a part of ~94K"), (2, 250_000, "a part below a quarter of the window"),
+                          (4, 150_000, "a part of ~140K at four ranks")):
+        have = shard.budget(unsh, 11, "fp8", N)
+        try:
+            shard.plan(unsh, 11, "fp8", lim, N, 16); refused = False
+        except ValueError as exc:
+            refused = str(have) in str(exc) and str(have // N) in str(exc) and str(lim) in str(exc)
+        check(f"9 floor N={N}: {what} ({have // N} tokens) is refused with the numbers", refused)
+    rows, note = shard.plan(1_060_864, 11, "fp8", 262_144, 2, 16)
+    check("9 floor: a smaller window that a part holds is untouched", not note)
 section("9 floor", floor_budget)
 
 def refusals():
