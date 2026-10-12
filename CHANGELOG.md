@@ -5,6 +5,15 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **The start-up budget counts the pages parked on the per-CPU free lists** (patch `0119-cuda-budget-parked-pages`, by
+  [wojo](https://github.com/wojo); CPU-checked, GPU validation pending). On kernel 6.7+ a bulk free leaves GiBs of
+  free pages on the per-CPU lists (`pagesets` `count:` in `/proc/zoneinfo`), in neither `MemFree` nor `MemAvailable`.
+  Besides the image copy that `MEMORY_SETTLE_TIMEOUT` waits for, the first start of a new image compiles
+  `tensorfold_roce_v1` inside the rank container ~1 s before the budget is read, and that parks 2.4 GiB
+  (`MemAvailable` -2.41 GiB at +1 s, -0.53 GiB at +49 s): the first start read 89.2 GiB "within" against 94.4 for a
+  restart, and `start.sh` cannot see it. `capacity._meminfo` now adds the parked pages (every zone and CPU, capped at
+  `MemTotal`; 0 when `/proc/zoneinfo` is unreadable) to `MemAvailable`, so `available_bytes`, `page_room` and the
+  memory gate agree, and the start-up log says how many it counted. `tools/parked_pages_check.py`.
 - **The first start of a new image no longer gets a smaller pool** (`MEMORY_SETTLE_TIMEOUT`, scripts only, no patch,
   by [wojo](https://github.com/wojo)). TensorFold budgets each rank from `MemAvailable` at start; the first start of an
   image the worker lacked (the `docker save` / `docker load` copy in `prepare.sh`) read 89.5 GiB on rank 0 and 88.2 on
