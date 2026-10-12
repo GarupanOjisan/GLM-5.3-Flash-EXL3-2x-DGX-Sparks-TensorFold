@@ -108,6 +108,8 @@ run settle-frees-none $B "        for b, _ in evs:\n            self.free_reads.
 run settle-before-slots $B "        evs = getattr(self, \"read_events\", None)" "        evs = self.read_events"
 # the writer: a write slot's event made at start and reused (wojo#2's pump made one a block, the writer dropped it)
 run write-event-per-block $B "                    ev = self.slot_events[slot] if self.slot_events else None   # (made at start: a GPU's only)\n                    if ev is not None:\n                        ev.record()\n" "                    ev = None\n                    if self.dev_slot.device.type == \"cuda\":\n                        ev = torch.cuda.Event()\n                        ev.record()\n"
+# LOADED on a rank with more blocks left than read slots: the wait frees the slots its copies hold
+run hang-no-recycle-in-wait $B "                    if self.read_events:                    # the slots this step's own copies used: back to the reader,\n                        self._recycle(wait=True)            # or it waits for one and block i is never read\n" ""
 rm -f "$OUT"
 echo "exit $bad"
 exit $bad

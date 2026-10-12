@@ -155,7 +155,11 @@ Every change to this recipe, newest first. Each release names the image it serve
   took 1.0-1.3 s on two Sparks and 8.6-12.7 s on three (measured by [BadAd84](https://github.com/BadAd84)); now
   0.54-0.61 s (idle 0.40-0.46 s), the same replies. The read-ahead (388 MiB on two Sparks) is pinned before the
   pool is sized, so it comes out of the pool (~60k tokens), not the margin it keeps. The write ring's size is
-  `TF_GLM_SPILL_STAGE_MIB` (256 MiB).
+  `TF_GLM_SPILL_STAGE_MIB` (256 MiB). A restore whose read fails on one Spark (a damaged or missing block) ends on every Spark and the
+  prompt is computed again: a Spark with more blocks left than read slots (above ~65k tokens) waited for ever for the
+  slots its own copies held (a ~100k-token conversation with damaged blocks on two Sparks: the request hung until the
+  client gave up after 15 minutes; now answered in 50 s, its prompt recomputed). CPU check: `hang` in
+  `tools/spill_blocks_check.py`.
 - **A system prompt prefilled once for every agent** (patch `0110`, `PREFIX_WAIT`, on): a request whose prompt starts
   with what another request is still prefilling waits for that state, apart from the queue, then resumes from it. Six
   agents at once on a fresh 12k-token system prompt: all answered in 14.7-15.0 s instead of 45.7-47.0 s, the slowest

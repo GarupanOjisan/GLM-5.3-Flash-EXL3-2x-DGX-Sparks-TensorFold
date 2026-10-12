@@ -11,10 +11,10 @@
 # for issue #122, reported by @xiepengqi; the rest by @wojo. Builds on 0088-glm-spill-tier. Apache-2.0.
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
 new file mode 100644
-index 0000000..8c73db8
+index 0000000..4d20974
 --- /dev/null
 +++ tensorfold/cuda/spill_blocks.py
-@@ -0,0 +1,1699 @@
+@@ -0,0 +1,1701 @@
 +"""The spill tier's block store for a shared pool of cache rows (``tensorfold serve --spill-gib`` with several streams):
 +every kept prompt state is written to this rank's disk when it is kept, so it survives an eviction, a restart and a
 +crash, and a later request that extends the same tokens reads it back instead of prefilling them.
@@ -1485,6 +1485,8 @@ index 0000000..8c73db8
 +                if upto is None and not (i in lj.queued and lj.queued[i][2].done()):
 +                    break
 +                while i not in lj.queued and lj.error is None and not lj.done.is_set():
++                    if self.read_events:                    # the slots this step's own copies used: back to the reader,
++                        self._recycle(wait=True)            # or it waits for one and block i is never read
 +                    lj.cond.wait(1.0)
 +                item = lj.queued.pop(i, None)
 +            if item is None:
