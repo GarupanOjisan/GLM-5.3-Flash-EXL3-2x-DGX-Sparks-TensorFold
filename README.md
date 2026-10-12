@@ -328,6 +328,22 @@ keeps its latents, the pooled keys staying on every Spark: 3,300 bytes a token a
 - **Pool**: evictions happen in one part only, the one whose newest needed eviction is the oldest; a new conversation
   goes to the part with fewer live streams. The spill tier and the display reservation work with it (each Spark stores
   what it holds; a restore goes back into its part). Not with `TF_GLM_MULTI_LONE`.
+- **Carry** (`TF_GLM_KV_SHARD_CARRY`, on; `0` turns it off): a resumed conversation, or a request starting from a
+  kept shared system prompt, uses rows its own part holds, so it lands in that part. With agents resuming all the time
+  one part fills while the other has room. When that would cost something, the cached rows go to the other part
+  instead (the owner sends the latents, ~5.8 KB a token over the Sparks' link; every Spark copies its pooled keys):
+  - *the cache would be dropped*: no room beside the kept rows, so the whole prompt was computed again (~93 s at 205k
+    tokens), now a carry of ~70 ms;
+  - *its part would evict kept conversations* to fit it, while the other part has the room free (with room to grow);
+  - *a live stream cannot grow* in its part and would pause: it moves whole, or a smaller stream of its part moves so
+    it grows in place; the target must keep room for its own streams, a moved stream stays put for 256 rounds and
+    never goes straight back; if no move is safe, it pauses as before.
+
+  Never to even out the parts (that would buy ~0.7% decode): when the request fits where it is without evicting,
+  nothing moves. Same replies (rows copied byte for byte). Nothing changes until a carry is due (one host-side check a
+  cache hit); a carry pauses every stream once for its transfer (two Sparks: 14-17 GB/s, at most 69 ms in a test of
+  124 carries, 3.38M tokens). Spill blocks of a sharded run name their part (a carried conversation's later blocks
+  are written by another owner); stores from before still restore.
 - **Refused at start**, with the reason: `TF_GLM_MULTI_VERIFY=serial`, and a part under 131,072 tokens or a quarter
   of the window. A part a little short of the window (a first start of a new image) caps a request at what a part
   holds, logged once at start.
@@ -833,7 +849,8 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 | `tools/display_kv_check.py [--gpu]` | patch 0072's checks, run in the image (`docker run ... --entrypoint python`, see the file): the setting, the span's mapping and unwinding through a fake driver, the carved planes and the pool's copies; with `--gpu`, the real span on a Spark whose display reservation is free |
 | `tools/qmm_noclusters_check.py [--time]` | patch 0103's checks: the installed 4-bit matmul against a build of the same sources with the old cluster rule, bit for bit at every decode shape of TP=4, TP=3 and TP=2 and at the 28 Mi edge, the path each call takes (and with `TF_GLM_QMM_CLUSTERS=1`), and a CUDA graph on side streams; run in the image on one GPU (`docker run --gpus all ... --entrypoint python`, see the file); `--time` prints the old and new paths' times |
 | `tools/pool_pressure.py [size]` | on a fresh server with nothing else sending requests: two conversations of ~`size` tokens (default 30000) take a turn each, others fill the pool, then each takes another turn; exit 1 when a turn resumes less than 90% of its previous prompt, 2 when the kept-prompt cap stops the fill first (a smaller pool runs it faster: `CONTEXT=131072 KV_POOL_GIB=0.5`) |
-| `tools/kv_shard_check.py` | patch 0118's checks, run in the image (`docker run ... --entrypoint python`, CPU only): the pool in parts at two, three and four ranks, eviction in one part only (the one losing the oldest states), placement by live streams, the sharded pool's size; fails on the unpatched placement |
+| `tools/kv_shard_check.py` | patch 0118's checks, run in the image (`docker run ... --entrypoint python`, CPU only): the pool in parts at two, three and four ranks, eviction in one part only (the one losing the oldest states), placement by live streams, the sharded pool's size, and the carry: when it runs and when it must not, its op order, the rows sent byte for byte (display span, bf16, a partial row, a bystander at three ranks), moves that do not bounce, spill names by part, `TF_GLM_KV_SHARD_CARRY=0` as before; fails on the unpatched placement |
+| `tools/kv_shard_mutants.sh` | the shard check must fail on each faithful mutant of the carry (a guard, rule or step taken out or turned the wrong way): 63, all killed |
 | `tools/pool_room_check.py` | patch 0074's checks, run in the image (`docker run ... --entrypoint python`, see the file): the pool's room-making on a CPU arena, what it evicts and moves, and rank 1 replaying the same ops |
 | `tools/test_queued_cancellation.py --source-root DIR` | patch 0073's checks on the CPU, against TensorFold's source with the patches applied (no GPU, no server): requests that wait while every slot is busy and whose client leaves are dropped at once, in queue order; `--expect-stock` before 0073 shows the old wait |
 | `tools/end_of_turn.py [label] [max_cut]` | 8 short French coding prompts, thinking off: counts the replies that run to `max_tokens` (48 requests) and measures P(end of turn) right after each reply's closing code fence; exit 1 above `max_cut` cut replies (default 4) |

@@ -13,7 +13,10 @@ Every change to this recipe, newest first. Each release names the image it serve
   (1.51M -> 2.83M; 1.85M -> 3.47M with `DISPLAY_KV_MIB=1792`), every reply byte-equal to the unsharded engine's, decode
   within 1%, prompts within noise when rows can be borrowed and +1.8-3.5% when they are sent. A borrowed row is pinned
   while its prompt fills (a compaction moving it gave wrong replies under concurrent load; found in review, fixed, and
-  a forced-compaction run on two Sparks is byte-equal). Builds on `0110` and `0111`. CPU check: `tools/kv_shard_check.py`.
+  a forced-compaction run on two Sparks is byte-equal). A cache hit whose part has no room no longer drops the cache
+  or evicts kept conversations while another part has room: its rows are carried there (`TF_GLM_KV_SHARD_CARRY`,
+  on; only when it saves a recompute, an eviction or a pause, never to even out the parts). Builds on `0110` and
+  `0111`. CPU checks: `tools/kv_shard_check.py`, `tools/kv_shard_mutants.sh`.
 
 - **A rewound conversation keeps its id** (patch `0111-glm-chat-continued`, by [wojo](https://github.com/wojo)): patch
   `0089` gave a stream a new conversation id unless it resumed from one of that conversation's own turn states, so a

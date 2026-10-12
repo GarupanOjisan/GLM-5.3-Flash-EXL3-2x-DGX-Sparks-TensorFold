@@ -3,12 +3,43 @@
 # computes every head of its rows (queries gathered, the other ranks' heads sent back). Prompts: the owner sends only
 # the history rows the chunk's sparse attention selects, or the other ranks borrow free rows of their part and
 # attend locally (taken back when needed). Same bits as unsharded. Spill tier and display reservation supported.
+# A cache hit whose part has no room is carried to another part (its latents sent by the owner) when that saves a
+# recompute, an eviction or a pause (TF_GLM_KV_SHARD_CARRY, on), never to even out the parts.
 # Builds on 0110 (spill tier) and 0111. By @wojo. Apache-2.0.
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
-index 30b9cbe..b4f29fb 100644
+index 30b9cbe..e287c42 100644
 --- tensorfold/cuda/spill_blocks.py
 +++ tensorfold/cuda/spill_blocks.py
-@@ -760,7 +760,7 @@ class BlockStore:
+@@ -12,7 +12,8 @@ snapshot fields: recurrences, windows, a head row; ``spill.encode``). On disk:
+   it, names the blocks its earlier turns wrote and writes only its new ones. States of the same ids computed apart
+   (another prompt chunking: other bits) never share a block by name; a block whose bytes equal one already on disk is
+   linked to it instead of written again (content dedup: two streams that prefilled the same system prompt at once
+-  store it once);
++  store it once); with TF_GLM_KV_SHARD the lineage also names the part the rows lie in (``in_part``: a rank holds the
++  latents of its own part only, so the same ids in another part are other bytes there);
+ - a point a state: ``points/<key>.ids`` (its ids; with pictures its keyed ids and its tokens), ``points/<key>.st``
+   (its small state, safetensors), then ``points/<key>.json`` naming its blocks with a CRC-32 of each, written LAST, so
+   a point with its json is complete. Every file goes to a temporary name, is fsynced and renamed; the folders are
+@@ -162,6 +163,18 @@ def fork(lineage: str, name: str, at: int) -> str:
+     return f"{lineage}|{name}@{int(at)}"
+ 
+ 
++def in_part(lineage: str, part: int) -> str:
++    """``lineage`` for rows that live in part ``part`` of a sharded pool (TF_GLM_KV_SHARD): the first computation's name
++    carries the part (``#<part>``), so every block name of the state does. The rank that owns a part writes its
++    latent rows, the others only its pooled keys, so the same ids in another part are other bytes on a rank: a state
++    carried to another part must not skip, by name, the blocks it wrote there before. Idempotent (a lineage read back
++    from disk, or forked from a kept state, already has one: it is replaced, never stacked), and the fork segments
++    after the first computation are untouched. An unsharded store never calls it, so its names are unchanged."""
++
++    head, bar, rest = (lineage or "").partition("|")
++    return f"{head.partition('#')[0]}#{int(part)}{bar}{rest}"
++
++
+ def _segments(lineage: str) -> tuple[bytes, list[tuple[int, bytes]]]:
+     head, *rest = (lineage or "").split("|")
+     forks = []
+@@ -760,7 +773,7 @@ class BlockStore:
          items, layer = _sp.encode(obj, skip=skip)
          items = [(k, _host(t)) for k, t in items]          # (serialized on the writer thread)
          small_n = sum(t.numel() * t.element_size() for _, t in items) + 4096
@@ -17,7 +48,7 @@ index 30b9cbe..b4f29fb 100644
          need = size + small_n + 8 * n * (2 if tokens is not None else 1)
          pt = Point(key, n, ids, None if tokens is None else np.asarray(tokens, dtype=np.int64), lineage,
                     [h for _, _, h in hashes], [], [], 0, small_n, bool(shared), bool(head), time.time(), None,
-@@ -799,6 +799,24 @@ class BlockStore:
+@@ -799,6 +812,24 @@ class BlockStore:
          self.stats["keep_s"] += time.perf_counter() - t0
          return "queued"
  
@@ -42,7 +73,7 @@ index 30b9cbe..b4f29fb 100644
      def _parts(self, where, s: int, e: int) -> list[torch.Tensor]:
          """Tokens [s, e) as each plane's rows, where the extent is NOW (it may have moved)."""
  
-@@ -806,8 +824,9 @@ class BlockStore:
+@@ -806,8 +837,9 @@ class BlockStore:
          out = []
          for p in self.planes:
              a, b = _rows(p, s, e)
@@ -54,7 +85,7 @@ index 30b9cbe..b4f29fb 100644
          return out
  
      def pump(self, limit: int | None = PUMP_BLOCKS) -> None:
-@@ -1415,7 +1434,7 @@ class BlockStore:
+@@ -1415,7 +1447,7 @@ class BlockStore:
              b = self._slot(lj)
              if b is None:
                  return
@@ -63,7 +94,7 @@ index 30b9cbe..b4f29fb 100644
              fut = self._readers.submit(self._read_block, h, pt.crcs[i], self.read_slots[b], nb)
              with lj.cond:
                  lj.queued[i] = (b, nb, fut, s, e, h)
-@@ -1525,7 +1544,9 @@ class BlockStore:
+@@ -1525,7 +1557,9 @@ class BlockStore:
          at = 0
          for p in self.planes:
              a, z = _rows(p, s, e)
@@ -75,7 +106,7 @@ index 30b9cbe..b4f29fb 100644
              v = dst.reshape(-1).view(torch.uint8)
              if p.spanned:
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 1f131ca..986e05d 100644
+index 1f131ca..288ea42 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -599,6 +599,14 @@ class GlmEngine:
@@ -112,7 +143,7 @@ index 1f131ca..986e05d 100644
                                 f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
                                 "; pull the draft model on every machine (or pass --drafter none to all) and give "
                                 "every rank the same flags")
-@@ -792,6 +801,33 @@ class GlmEngine:
+@@ -792,6 +801,34 @@ class GlmEngine:
              print("[tensorfold] the checkpoint's MTP head is not loaded (TF_GLM_MTP=" +
                    (os.environ.get("TF_GLM_MTP", "").strip() or MTP_DEFAULT) + "): " +
                    ("DFlash2 drafts every request" if drafter is not None else "--no-drafts"), flush=True)
@@ -136,6 +167,7 @@ index 1f131ca..986e05d 100644
 +            from . import tp
 +
 +            shard.setup(rank, world, pool_rows, heads=[tp.of(w).at(r).heads for r in range(world)])
++            shard.warm(self.comm, w.device)         # (TP3 and up: the pairs' send/recv connections now, not at a carry)
 +            self.limit = min(self.limit, shard.HALF - MAX_ROWS)        # (a stream lives in one part: what plan noted)
 +            self.capacity_plan["context_window"] = self.limit
 +            self.capacity_plan["pool_tokens"] = pool_rows
@@ -392,9 +424,18 @@ index bbae712..82b432c 100644
  
  def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, int] | None = None) -> torch.Tensor | None:
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index 33dc834..83d14ba 100644
+index 33dc834..d4d5136 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -25,7 +25,7 @@ are balanced within the budget without adding rounds; GPU layer cost, finalizati
+ learned separately so extra slices cannot inflate every layer cost.
+ 
+ Rank 0 decides everything that depends on time, clients or placement; rank 1 applies it. Each iteration rank 0 sends
+-ONE message (``GlmEngine._share``): ops ADMIT, EVICT, MOVE, GROW, FILL, MFILL, FILLPART, MFILLPART, ROUND, FINISH, IDLE, which both ranks apply
++ONE message (``GlmEngine._share``): ops ADMIT, EVICT, MOVE, XMOVE, GROW, FILL, MFILL, FILLPART, MFILLPART, ROUND, FINISH, IDLE, which both ranks apply
+ in order through the same code (rank 0 as it decides them). Rank 1 derives drafts itself and checks the depths rank 0
+ sent. An idle rank 1 waits on the doorbell (``GlmEngine._await_bell``), not in an all-gather. After an error the two
+ ranks cannot be trusted to agree: ``broken`` latches and every later call fails until both restart.
 @@ -51,16 +51,16 @@ from tensorfold.cuda.scheduler import Scheduler
  from tensorfold.server.errors import CapacityError  # TFCAP-0075
  from tensorfold.cuda.streams import Stream, next_fill
@@ -407,23 +448,89 @@ index 33dc834..83d14ba 100644
  
  ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL, FILLPART, MFILLPART, LOAD, FLUSH, LOADED, \
 -    HAS, LOADPART = range(1, 18)
-+    HAS, LOADPART, UNTWIN = range(1, 19)
++    HAS, LOADPART, UNTWIN, XMOVE = range(1, 20)
  OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
         IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL", FILLPART: "FILLPART", MFILLPART: "MFILLPART", LOAD: "LOAD",
 -       FLUSH: "FLUSH", LOADED: "LOADED", HAS: "HAS", LOADPART: "LOADPART"}
-+       FLUSH: "FLUSH", LOADED: "LOADED", HAS: "HAS", LOADPART: "LOADPART", UNTWIN: "UNTWIN"}
++       FLUSH: "FLUSH", LOADED: "LOADED", HAS: "HAS", LOADPART: "LOADPART", UNTWIN: "UNTWIN", XMOVE: "XMOVE"}
  # TF_GLM_SPILL_LOAD_MS (default 40): the most a step of the reads in flight copies between two rounds (rank 0's time)
  LOAD_MS_DEFAULT = 40.0
  
-@@ -498,6 +498,7 @@ class Lane:
+@@ -223,6 +223,62 @@ def kept_bytes_cap() -> int:
+ KEPT_BYTES_CAP = kept_bytes_cap()
+ 
+ 
++def kv_carry(value: str | None = None) -> bool:
++    """TF_GLM_KV_SHARD_CARRY (default 1; 0 = off, every decision as before the carry existed): with TF_GLM_KV_SHARD, a
++    request that resumes from a kept state may have the state's rows carried into another part (``Arena.carry``)
++    instead of being forced into the state's part, but only to avoid a real cost, never to even the parts out: when
++    that part has no room beside the state (the hit used to be dropped and the whole prompt prefilled again), when
++    fitting the request there would evict kept states while another part has the room free, or when the other parts'
++    free rows spare evicting other conversations' states from the shared rows (``MultiDecoder._place_hit``); and a
++    live stream that cannot grow in its part moves whole to one that has room (XMOVE) instead of pausing. Rank 0
++    decides, so only its setting matters; every rank applies a carry it is sent."""
++
++    raw = (os.environ.get("TF_GLM_KV_SHARD_CARRY", "") if value is None else value).strip() or "1"
++    if raw not in ("0", "1"):
++        raise ValueError(f"TF_GLM_KV_SHARD_CARRY: 0 or 1, not {raw!r}")
++    return raw == "1"
++
++
++KV_CARRY = kv_carry()
++# A hit of at least this many tokens (one pool block) is carried, a smaller one never: a smaller one saves under a second of prefill
++# (~0.45 ms a token measured at 205k) and a carry has costs a small state does not repay -- the flush, a send and a
++# receive per sharded plane and the wait for them, during which no lane decodes. (A fixed number, not a setting.)
++CARRY_MIN = 2048
++CARRY_LOG = 8192                         # rank 0 logs a carry of this many tokens or more, one line each
++# a live stream that has moved is not moved again, nor back into the part it left, and no stream leaves a part another
++# one entered, for this many decode rounds. A round is a token or so a stream (~20-40 ms), so 256 rounds are ~5-10 s:
++# an order of magnitude over what a carry costs (~0.1-0.5 s at 200k tokens), so a stream that moves pays for itself
++# before it can move again, and the headroom a move needs in its target (a block for each stream the part holds) is
++# hundreds of rounds of growth. (A fixed number, not a setting.)
++RELOCATE_HOLD = 256
++
++
++def shard_tune(tune):
++    """The settings the decoder runs with: TF_GLM_MULTI_LONE is on by default (``MultiSettings``), but a lone stream
++    moves home to the pool's first rows and its one-stream graphs bake the extent's base, which the shard refuses (an
++    explicit LONE=1 is refused at start), so with the shard on it is off, whatever the default says. Left on, it also
++    switched off the shared-rows copy and the carry beside it (``_place``)."""
++
++    if not shard.ON or not tune.lone or not KV_CARRY:   # (TF_GLM_KV_SHARD_CARRY=0: the decoder as before the carry)
++        return tune
++    import dataclasses
++
++    return dataclasses.replace(tune, lone=False)
++
++
++def carry_stats() -> dict:
++    """/health's ``carry`` (kv_shard): admissions that carried a kept state into another part (``hits``, by the rule
++    that chose it: ``rescued`` where its own part had no room, so the hit would have been dropped; ``pressure`` where
++    fitting the request there would have evicted kept states and another part had the room free; ``others`` where the
++    other parts' free rows spared evicting other conversations' states), live streams moved (``live``), the tokens and
++    bytes sent, the time (ms, the transfer's, of every carry and the longest), and the carries not made, by why
++    (``refused``)."""
++
++    return {"hits": 0, "rescued": 0, "pressure": 0, "others": 0, "live": 0, "tokens": 0, "bytes": 0,
++            "ms_total": 0.0, "ms_max": 0.0,
++            "refused": {"pinned": 0, "twin": 0, "loading": 0, "partial": 0, "no_target": 0, "small": 0}}
++
++
+ def known_key(c):
+     """A kept state's key as an int64 array, converted once: every admission scans all of ``kept`` for the prefix a
+     new prompt shares, and rebuilding the array each time cost O(kept states x their tokens) a request."""
+@@ -498,6 +554,10 @@ class Lane:
      images: bool = False               # both ranks: the prompt has pictures (its kept states are told apart by key)
      chat: int = 0                      # the conversation this stream belongs to (its kept states are capped together)
      lineage: str = ""                  # the computation its rows belong to (the spill tier's block names)
 +    twin: Any = None                   # TF_GLM_KV_SHARD: the extents its filling prompt borrows in the other parts
++    xwhy: str | None = None            # rank 0: why its last move to another part was refused (counted once a reason)
++    moved_at: int = -(1 << 30)         # rank 0: the decode round (``xticks``) it last moved to another part in
++    came_from: int = -1                # ...and the part it left then
      decoding: bool = False
      paused: bool = False
      t0: float = 0.0
-@@ -541,7 +542,9 @@ class MultiDecoder:
+@@ -541,7 +601,9 @@ class MultiDecoder:
          if self.window < streams:
              raise ValueError(f"a verify window of {self.window} rows cannot hold {streams} streams' pending tokens")
          self.rows_max = e.rows                           # a stream's window (decode.MAX_ROWS)
@@ -434,16 +541,28 @@ index 33dc834..83d14ba 100644
          self.arena = e.caches.arena
          self.grid = engine.grid
          self.fill_rows = fill_rows(e.prefill_rows, self.grid)
-@@ -605,6 +608,8 @@ class MultiDecoder:
+@@ -581,7 +643,7 @@ class MultiDecoder:
+                 verify = SerialVerify(e, taps=self.drafts is not None)
+         self.verify = verify
+         # speed settings (multi_tune): the sampler's gathers, the drafts' depth, async messages, the profile
+-        self.tune = tune if tune is not None else MultiSettings.from_env()
++        self.tune = shard_tune(tune if tune is not None else MultiSettings.from_env())
+         self.profiles = None
+         if self.tune.profile and self.rank == 0:
+             self.profiles = {False: RoundProfile(self.tune.profile, label="batched"),
+@@ -605,6 +667,11 @@ class MultiDecoder:
          self.lanes: dict[int, Lane] = {}                 # by sid, in admission order
          self.kept: list = []                             # kept prompts (decode.Snapshot + kid, extent), oldest first
          self.load_turn = 0                               # which read in flight ``step_loads`` serves first
 +        self.twins = {"made": 0, "revoked": 0}           # TF_GLM_KV_SHARD: prompts filled with borrowed rows
 +        self.no_part = 0                                 # TF_GLM_KV_SHARD: placements refused (no part could make room)
++        self.carry = carry_stats()                       # TF_GLM_KV_SHARD_CARRY: hits and live streams moved across parts
++        self.xticks = 0                                  # rank 0: decode rounds decided (the moves' cooldown counts them)
++        self.entered: dict[int, int] = {}                # rank 0: part -> the round a live stream last moved into it
          self.boot = os.urandom(6).hex()                  # this process's lineages (a fresh prefill's) are its own
          self.prefix_waits = 0                            # requests that waited for a prefix another one prefilled
          self.prefix_wait_tokens = 0                      # the prompt tokens they did not prefill again
-@@ -635,12 +640,34 @@ class MultiDecoder:
+@@ -635,12 +702,36 @@ class MultiDecoder:
      def live(self) -> int:
          return len(self.lanes)
  
@@ -465,7 +584,9 @@ index 33dc834..83d14ba 100644
 +                          "live_rows": sum(x.size for x in xs if x.owner is not None),
 +                          "kept_rows": sum(x.size for x in xs if x.owner is None and not x.twin),
 +                          "twin_rows": sum(x.size for x in xs if x.twin), "live": pool.live(h)})
-+        return {"parts": parts, "fetch": dict(shard.STATS), "refused_no_part": self.no_part}
++        return {"parts": parts, "fetch": dict(shard.STATS), "refused_no_part": self.no_part,
++                "carry": dict(self.carry, ms_total=round(self.carry["ms_total"], 1), ms_max=round(self.carry["ms_max"], 1),
++                              refused=dict(self.carry["refused"]))}
 +
      def health(self) -> dict:
          lanes = list(self.lanes.values())
@@ -478,7 +599,16 @@ index 33dc834..83d14ba 100644
                  "kept_prompts": len(self.kept),
                  # streams that continued their conversation without resuming from its own turn state (a rewind before
                  # its kept states, or they were dropped or read back from disk), and the tokens those prefilled
-@@ -841,13 +868,29 @@ class MultiDecoder:
+@@ -831,6 +922,8 @@ class MultiDecoder:
+             if op == MFILLPART and (len(p) < 5 or p[0] < 1 or len(p) != 3 + 2 * p[0]
+                                     or not 0 <= p[1] < p[2]):
+                 raise RuntimeError("invalid MFILLPART payload")
++            if op == XMOVE and len(p) != 4:
++                raise RuntimeError("invalid XMOVE payload")
+             ops.append((op, p))
+             i += 2 + n
+         return ops
+@@ -841,13 +934,29 @@ class MultiDecoder:
  
      def fits(self, s: Stream) -> bool:
          """Whether ``s`` can be placed now (else it waits, in order, for streams to finish): the free rows and the
@@ -511,26 +641,324 @@ index 33dc834..83d14ba 100644
  
      def admit(self, s: Stream) -> None:
          """Rank 0: place a request (slot, extent; resumed from the longest kept prefix of its prompt when it drafts)
-@@ -908,7 +951,7 @@ class MultiDecoder:
-             # the writer's whole extent there, the shared state included.
-             others = [c for c in x.kept if len(c.ids) > len(hit.ids) and key[:len(c.ids)] != c.key]
-             if others and not self.tune.lone:
+@@ -895,36 +1004,7 @@ class MultiDecoder:
+         if s.vision is not None:              # encoded before anything is sent: a failure stops here
+             feed = self._encode(s.vision, encoded_from)
+         need = self._need(len(prompt))
+-        # placement: take a kept extent over in place, or copy its rows into a new one while a stream writes in it
+-        copy = 0
+-        base = None
+-        if hit is not None and hit.extent.owner is None:
+-            x = hit.extent
+-            # kept prompts the stream would overwrite: another conversation's longer states in the same rows (a shared
+-            # system prompt's state lives in the extent of the conversation that wrote it). Copy the shared rows into
+-            # an extent of their own instead, so that conversation keeps its state. Only into free rows: evicting other
+-            # conversations to make room would cost more than it saves, so then the rows are overwritten as before.
+-            # Not with TF_GLM_MULTI_LONE=1: the copy, decoding alone, would move home to the pool's first rows and evict
+-            # the writer's whole extent there, the shared state included.
+-            others = [c for c in x.kept if len(c.ids) > len(hit.ids) and key[:len(c.ids)] != c.key]
+-            if others and not self.tune.lone:
 -                base = self.pool.place(need)
-+                base = self.pool.place(need, half=self.pool.half_of(x) if self.pool.half else None)
-                 copy = int(base is not None)
-             if base is None:
-                 for c in others:
-@@ -918,7 +961,8 @@ class MultiDecoder:
-                 else:
-                     hit = None
-         if base is None:
+-                copy = int(base is not None)
+-            if base is None:
+-                for c in others:
+-                    self._evict(c)
+-                if self._grow(x, need, protect=[x]):
+-                    base = x.base
+-                else:
+-                    hit = None
+-        if base is None:
 -            base = self._room(need, [hit.extent] if hit is not None else [])
-+            base = self._room(need, [hit.extent] if hit is not None else [],
-+                              half=self.pool.half_of(hit.extent) if hit is not None and self.pool.half else None)
-             if base is None and hit is not None:          # no room beside the kept rows: start fresh
-                 hit = None
-                 base = self._room(need)
-@@ -1058,6 +1102,25 @@ class MultiDecoder:
+-            if base is None and hit is not None:          # no room beside the kept rows: start fresh
+-                hit = None
+-                base = self._room(need)
+-            if base is None:
+-                raise NoRoom(f"no room for a {need}-token extent in the {self.pool.rows}-token pool now")
+-            copy = int(hit is not None)
++        base, copy, hit = self._place_hit(hit, need, key)
+         if s.vision is not None and hit is None and encoded_from:
+             feed = None                       # (its rows freed before the tower runs again)
+             feed = self._encode(s.vision, 0)  # the kept state was given up: every picture, from the prompt's start
+@@ -945,13 +1025,265 @@ class MultiDecoder:
+         payload += [len(packed), *packed, len(positions), *positions, int(s.vision is not None),
+                     *pack_keys(vrows, vkeys, vpos)]
+         self._emit(ADMIT, payload)
++        if copy == 2 and self.carry_kind:         # (counted once the ADMIT is queued: a placement that failed earlier is not)
++            self.carry[self.carry_kind] += 1
+         try:
++            if copy == 2:                     # a carry is a collective: the other ranks hold this ADMIT before rank 0 sends
++                self._sync()
+             self._admitted(self._parse_admit(payload), s, feed, s.constraint, info.get("spec", ""))
+         except Exception as exc:              # rank 1 applies the same ADMIT: the ranks may no longer agree
+             self.broken = exc
+             raise
+         self.lanes[sid].key = key
+ 
++    carry_kind = None                     # rank 0: which rule chose the carry ``_place_hit`` just decided (counted at the ADMIT)
++
++    def _place_hit(self, hit, need: int, key) -> tuple[int, int, Any]:
++        """Rank 0: where a request's extent goes and how its rows get there -> (base, copy, hit). ``copy`` 0: the request
++        takes the kept extent over in place; 1: the hit's rows are copied into a new extent of its part while a stream
++        writes in it; 2 (TF_GLM_KV_SHARD_CARRY): they are carried into a new extent in ANOTHER part (``Arena.carry``, a
++        collective: ``admit`` flushes the ADMIT before it runs). ``hit`` comes back None when the hit was given up and
++        the whole prompt prefills (nothing to resume from, or no room for it anywhere).
++
++        Without parts, or with the carry off, every decision is the one made before the carry existed. With parts a
++        carry is made only to avoid a real cost, and never when the hit's part fits the request without evicting
++        anything, however empty another part is: (1) the hit's part has no free rows for the copy that spares other
++        conversations' longer states from being overwritten: free rows of another part take it, before those states
++        are evicted (``_free_elsewhere``); (2) fitting the request in its part would evict kept states (or cannot be
++        done), and another part has the room free, plus headroom for the streams it holds, with no eviction there
++        (``_pressed``); (3) where the hit used to be DROPPED (and the prompt recomputed -- ~93 s at 205k tokens),
++        another part's room, evicting there as the drop would have, keeps it (``_rescue``). A hit under ``CARRY_MIN``
++        tokens is never carried. Host-side arithmetic over the parts, nothing on the common path. A carry wanted and
++        refused is counted once a reason (``carry.refused``), however many of the rules asked; the rule that chose a
++        carry is left in ``carry_kind`` for ``admit`` to count once the ADMIT is queued."""
++
++        why: set[str] = set()
++        self.carry_kind = None
++        try:
++            return self._place(hit, need, key, why)
++        finally:
++            for w in sorted(why):
++                self._refused(w)
++
++    def _place(self, hit, need: int, key, why: set) -> tuple[int, int, Any]:
++        pool = self.pool
++        sharded = KV_CARRY and bool(pool.half)
++        copy = 0
++        base = None
++        others: list = []
++        if hit is not None and hit.extent.owner is None:
++            x = hit.extent
++            # kept prompts the stream would overwrite: another conversation's longer states in the same rows (a shared
++            # system prompt's state lives in the extent of the conversation that wrote it). Copy the shared rows into
++            # an extent of their own instead, so that conversation keeps its state. Only into free rows: evicting other
++            # conversations to make room would cost more than it saves, so then the rows are overwritten as before.
++            # Not with TF_GLM_MULTI_LONE=1: the copy, decoding alone, would move home to the pool's first rows and evict
++            # the writer's whole extent there, the shared state included.
++            others = [c for c in x.kept if len(c.ids) > len(hit.ids) and key[:len(c.ids)] != c.key]
++            if others and not self.tune.lone:
++                base = pool.place(need, half=pool.half_of(x) if pool.half else None)
++                copy = int(base is not None)
++                if base is None and sharded:             # its part is full: free rows of another carry them instead
++                    base = self._free_elsewhere(hit, need, why)
++                    if base is not None:
++                        copy = 2
++                        self.carry_kind = "others"
++        if base is None and hit is not None and sharded:
++            base = self._pressed(hit, need, others, why)
++            if base is not None:
++                copy = 2
++        if base is None and hit is not None and hit.extent.owner is None:
++            x = hit.extent
++            # (with parts a grow that cannot work is not tried: ``_grow`` evicts every kept prompt it may before it gives
++            # up, and the rescue below keeps the hit without that)
++            grown = False
++            if not sharded or self._grow_fits(x, need):
++                for c in others:
++                    self._evict(c)
++                grown = self._grow(x, need, protect=[x])
++            if grown:
++                base = x.base
++            elif not sharded:
++                hit = None
++        if base is None:
++            part = pool.half_of(hit.extent) if hit is not None and pool.half else None
++            spent = self.no_part
++            base = self._room(need, [hit.extent] if hit is not None else [], half=part)
++            if base is None and hit is not None:          # no room beside the kept rows
++                refused = self.no_part
++                got = self._rescue(hit, need, why) if sharded else None
++                if sharded:                               # (counted as the old code did: the refusal of a part's own
++                    self.no_part = spent if got is not None or hit.extent.owner is None else refused   # attempt, once)
++                if got is not None:                       # ...but another part has it: the hit stays, its rows travel
++                    return got[0], got[1], hit
++                hit = None                                # start fresh
++                base = self._room(need)
++            if base is None:
++                raise NoRoom(f"no room for a {need}-token extent in the {pool.rows}-token pool now")
++            copy = int(hit is not None)
++        return base, copy, hit
++
++    def _fits_unevicted(self, hit, need: int, others: list) -> bool:
++        """Rank 0, read only: whether the hit's part places the request without evicting anything, by the paths the old
++        code takes: with other conversations' longer states in the hit's extent (the shared-rows copy), a single stretch
++        of free rows ``need`` long (the copy gathers nothing; with TF_GLM_MULTI_LONE they would be overwritten, an
++        eviction); otherwise the request takes the extent over in place -- a free stretch elsewhere in the part, or the
++        extent's own segment (the rows between pinned twins, free rows gathered by compacting) with its rows counted
++        free -- or, when a live stream holds the extent, copies beside it into free rows of any segment (gathered by
++        compacting). Twins that can be given back are not in the way; pinned ones cut the part."""
++
++        pool = self.pool
++        x = hit.extent
++        p = pool.half_of(x)
++        if others:
++            return not self.tune.lone and pool.place(need, half=p) is not None
++        pin = self._pinned()
++        loose = [y for y in pool.extents if y.twin and not pin(y)]
++        inplace = x.owner is None
++        if inplace and pool.place(need, ignore=[x] + loose, half=p) is not None:
++            return True
++        for lo, hi in pool.segments(p, pin):
++            if inplace and not lo <= x.base < hi:
++                continue
++            held = sum(y.size for y in pool.extents if lo <= y.base < hi and not y.twin and not (inplace and y is x))
++            if hi - lo - held >= need:
++                return True
++        return False
++
++    def _pressed(self, hit, need: int, others: list, why: set) -> int | None:
++        """Rank 0: the hit's part cannot place the request without evicting kept states (or at all): the rows of another
++        part that has ``need`` free plus a block for each stream it holds and the one arriving (``ALIGN * (live + 1)``:
++        what ``fits`` leaves a part's decoders, so the moved conversation is not the next to find it full), found without
++        evicting anything there (free rows, or gathered by compacting that part) -> its base, ``carry_kind`` set
++        ("rescued" where the hit's part could not have placed the request even by evicting: the hit would have been
++        dropped). None when its part has the room, the hit is under ``CARRY_MIN``, something pins its rows, or no
++        other part has it (the last two counted in ``why``)."""
++
++        if self._fits_unevicted(hit, need, others):
++            return None
++        if len(hit.ids) < CARRY_MIN:
++            why.add("small")
++            return None
++        pin = self._pins(hit.extent)
++        if pin is not None:
++            why.add(pin)
++            return None
++        pool = self.pool
++        p = pool.half_of(hit.extent)
++        for q in sorted((q for q in range(pool.parts) if q != p), key=lambda q: (pool.live(q), -pool.free_rows(q), q)):
++            want = need + ALIGN * (pool.live(q) + 1)
++            if pool.place(want, half=q) is not None or pool.compactable(q) >= want:
++                base = self._room_free(want, q)
++                if base is not None:
++                    self.carry_kind = "pressure" if self._placeable(hit, need) else "rescued"
++                    return base
++        why.add("no_target")
++        return None
++
++    def _placeable(self, hit, need: int) -> bool:
++        """Rank 0, read only: whether the hit's part could place the request at all, evicting what it may (else the hit
++        would be dropped)."""
++
++        x = hit.extent
++        if x.owner is None:
++            return self._grow_fits(x, need)
++        pool = self.pool
++        p = pool.half_of(x)
++        return (pool.place(need, half=p) is not None or self._gathered(need, p) is not False
++                or self._eviction_cost(need, [x], p) is not None)
++
++    def _pins(self, x) -> str | None:
++        """Rank 0: why the rows of extent ``x`` cannot be carried or moved to another part now (``carry.refused``'s
++        names), or None. ``loading``: a stored prompt is being read into it; ``pinned`` / ``twin``: it is a filling
++        prompt's borrowed rows (a pinned one is the fill part way through its layers), or its stream holds some -- the
++        stream's state points at them, and they exist in the part a carry would send the rows to as well; ``partial``:
++        its stream is in a prompt slice in flight, whose later layers write the rows its earlier ones read."""
++
++        if getattr(x, "loading", None) is not None:
++            return "loading"
++        if self._pinned()(x):
++            return "pinned"
++        lane = self.lanes.get(x.owner) if x.owner is not None else None
++        if x.twin or (lane is not None and lane.twin is not None):
++            return "twin"
++        if lane is not None and self.partial is not None and self.partial.contains(lane.sid):
++            return "partial"
++        return None
++
++    def _refused(self, why: str) -> None:
++        self.carry["refused"][why] += 1
++
++    def _room_free(self, need: int, part: int) -> int | None:
++        """Rank 0: a base for ``need`` rows in ``part`` without evicting anything: free rows, or those gathered by
++        compacting the part (MOVEs within it)."""
++
++        base = self.pool.place(need, half=part)
++        if base is None and self._gathered(need, part) is not False:
++            self._compact(half=part)
++            base = self.pool.place(need, half=part)
++        return base
++
++    def _free_elsewhere(self, hit, need: int, why: set) -> int | None:
++        """Rank 0: free rows for ``need`` in a part other than the hit's, the lightest first (no eviction, no
++        compaction: the others branch carries only where the copy is cheap); None when there are none, the hit is under
++        ``CARRY_MIN`` or something pins its rows (``why`` collects the reasons)."""
++
++        pool = self.pool
++        if len(hit.ids) < CARRY_MIN:
++            why.add("small")
++            return None
++        pin = self._pins(hit.extent)
++        if pin is not None:
++            why.add(pin)
++            return None
++        p = pool.half_of(hit.extent)
++        for q in sorted((q for q in range(pool.parts) if q != p), key=lambda q: (pool.live(q), -pool.free_rows(q), q)):
++            base = pool.place(need, half=q)
++            if base is not None:
++                return base
++        why.add("no_target")
++        return None
++
++    def _grow_fits(self, x, size: int, free=()) -> bool:
++        """Rank 0, read only: whether ``_grow`` could make extent ``x`` ``size`` rows in its part, evicting every kept
++        prompt it may and giving back the twins it can: whether some stretch of the part between pinned twins has that
++        many rows once the live streams' extents and the extents it cannot evict (a stored prompt being read into one)
++        are left out; ``x`` and the rows it holds count as free, and so do the extents in ``free`` (streams about to
++        move away). Never says no to a grow that would work."""
++
++        pool = self.pool
++        half = pool.half_of(x) if pool.half else None
++        gone = {id(y) for y in free}
++        for lo, hi in pool.segments(half, self._pinned()):
++            held = sum(y.size for y in pool.extents if y is not x and lo <= y.base < hi and not y.twin
++                       and id(y) not in gone and (y.owner is not None or not y.kept))
++            if hi - lo - held >= size:
++                return True
++        return False
++
++    def _rescue(self, hit, need: int, why: set) -> tuple[int, int] | None:
++        """Rank 0: the hit's part has no room for ``need`` rows beside it, so the other parts are asked (evicting
++        there as dropping the hit would have, never the hit's own extent) -> (base, copy) with copy 2 when the room is
++        in another part: its rows are carried and the prompt resumes instead of prefilling again (``carry_kind``
++        "rescued"). None (counted) when the hit is under ``CARRY_MIN``, something pins its rows, or no part has the
++        room either."""
++
++        if len(hit.ids) < CARRY_MIN:
++            why.add("small")
++            return None
++        pin = self._pins(hit.extent)
++        if pin is not None:
++            why.add(pin)
++            return None
++        base = self._room(need, [hit.extent])
++        if base is None:
++            why.add("no_target")
++            return None
++        if self.pool.half_of(base) == self.pool.half_of(hit.extent):
++            return base, 1
++        self.carry_kind = "rescued"
++        return base, 2
++
+     def _encode(self, prepared, cut: int):
+         """Rank 0: the tower's rows of the pictures a prompt resumed at ``cut`` still fills (those whose rows end past
+         it), as a VisionFeed; None when the kept state already holds them all."""
+@@ -1025,7 +1357,11 @@ class MultiDecoder:
+             self._rewrites(x, cut)
+         else:
+             x = self.pool.add(a["base"], a["size"])
+-            if hit is not None:
++            if a["copy"] == 2 and hit is None:
++                raise RuntimeError(f"stream {a['sid']}: a carry (copy 2) of no kept prompt")
++            if hit is not None and a["copy"] == 2:       # another part: its owner's rows travel (rank 0 flushed first)
++                self._carry(hit.extent.base, x.base, cut, "admit")
++            elif hit is not None:
+                 self.arena.copy(hit.extent.base, x.base, cut)
+         x.owner = a["sid"]
+         st = State(self.w, x.size, e.rows, caches=e.caches, base=x.base, slots=e.slots, slot=a["slot"])
+@@ -1058,6 +1394,25 @@ class MultiDecoder:
  
          own = f"{self.boot}-{a['sid']}"
          lane.lineage = fork(hit.lineage, own, cut) if getattr(hit, "lineage", "") else own
@@ -556,7 +984,34 @@ index 33dc834..83d14ba 100644
          if a.get("keyed") is not None:              # rank 1 too: its kept states are stored and matched by them
              lane.key = a["keyed"]
          self.next_sid = max(self.next_sid, a["sid"] + 1)
-@@ -1320,12 +1383,14 @@ class MultiDecoder:
+@@ -1083,7 +1438,7 @@ class MultiDecoder:
+                     raise RuntimeError(f"the kept prompt {a['kid']} is the whole prompt of stream {a['sid']} but "
+                                        f"kept no head row")
+                 lane.head = hit.head.clone()
+-            self._touch(hit)
++            self._recent(hit, a["copy"])
+         # where its prompt states are kept: the grid point (or the end) and rank 0's shared-prefix points
+         if a["draft"]:
+             lane.point = grid_point(len(prompt), cut, self.grid)
+@@ -1140,6 +1495,17 @@ class MultiDecoder:
+     def _touch(self, c) -> None:
+         self.kept = [k for k in self.kept if k is not c] + [c]
+ 
++    def _recent(self, hit, copy: int) -> None:
++        """Both ranks: a request just resumed from ``hit``, which becomes the most recently used kept state -- except a
++        conversation's OWN turn state that the request carried into another part (``copy`` 2): the carried rows are the
++        conversation's now (its next turn resumes from the state kept where they are), so the old copy keeps its place
++        in the order and is the first the LRU reclaims in its part. A shared prefix is touched as ever: it stays for
++        the other conversations that resume from it."""
++
++        if copy == 2 and getattr(hit, "own", False):
++            return
++        self._touch(hit)
++
+     def _keep(self, lane: Lane, n: int, head=None, own: bool = False) -> None:
+         """Both ranks: the lane's state at prompt position n (== its pos) becomes a kept prompt in its extent;
+         ``head``: at the prompt's end, the logits row its first token is sampled from (kept for a replay);
+@@ -1320,12 +1686,14 @@ class MultiDecoder:
          drafter = getattr(self.g, "drafter", None)
          model = os.path.basename(str(getattr(self.g, "model_dir", "")).rstrip("/"))
          # what the stored bits depend on: build and runtime, drafter, KV and dense formats, TP layout, plane shapes,
@@ -573,9 +1028,44 @@ index 33dc834..83d14ba 100644
          self.loads: dict = {}                  # load id -> a stored prompt being read into a new extent
          self.next_lid = 0
          self.load_budget = float(os.environ.get("TF_GLM_SPILL_LOAD_MS") or LOAD_MS_DEFAULT) / 1000.0
-@@ -1418,7 +1483,8 @@ class MultiDecoder:
+@@ -1354,9 +1722,9 @@ class MultiDecoder:
+             self._release_rows(x, 0)
+             return remove(x)
+ 
+-        def g_move(x, base, size=None):
+-            self._release_rows(x, None)
+-            return move(x, base, size)
++        def g_move(x, base, size=None, cross=False):
++            self._release_rows(x, 0 if cross else None)     # (another part's owner would stage a waiting write's rows)
++            return move(x, base, size, cross)
+ 
+         def g_resize(x, size):
+             self._release_rows(x, size)
+@@ -1407,6 +1775,18 @@ class MultiDecoder:
+             return "no_draft_window"
+         return None
+ 
++    def _lineage(self, c) -> str:
++        """The lineage a kept state's blocks are named by: its own, and with parts (TF_GLM_KV_SHARD) the part its extent
++        lies in. A part's owner writes the latent rows and the other ranks only the pooled keys, so one name could
++        be two different blocks on a rank once a conversation can change part (``Arena.carry``): the owner of its new
++        part would find the old part's blocks, by name, already on disk and skip writing the rows it alone holds. Every
++        sharded store is named this way, carried or not (names do not depend on whether a state ever moved), and an
++        unsharded store's names are as they were."""
++
++        from tensorfold.cuda.spill_blocks import in_part
++
++        return in_part(c.lineage, self.pool.half_of(c.extent)) if self.pool.half else c.lineage
++
+     def _persist(self, c) -> None:
+         """Both ranks, as ``c`` is kept: its state to this rank's disk (``BlockStore.persist``; a failure only leaves it
+         off disk)."""
+@@ -1416,9 +1796,10 @@ class MultiDecoder:
+             self.disk.unwritten(why)
+             return
          try:
-             self.disk.persist(self._ident(c), c, extent=c.extent, lineage=c.lineage,
+-            self.disk.persist(self._ident(c), c, extent=c.extent, lineage=c.lineage,
++            self.disk.persist(self._ident(c), c, extent=c.extent, lineage=self._lineage(c),
                                tokens=c.ids if c.images else None, shared=bool(c.shared), head=c.head is not None,
 -                              skip=self._SPILL_SKIP)
 +                              skip=self._SPILL_SKIP,
@@ -583,7 +1073,7 @@ index 33dc834..83d14ba 100644
          except Exception as exc:                 # noqa: BLE001  (a spill never fails the engine)
              print(f"[tensorfold] spill rank {self.rank}: not written: {exc!r}", flush=True)
              self.disk.unwritten("failed")
-@@ -1473,7 +1539,13 @@ class MultiDecoder:
+@@ -1473,7 +1854,13 @@ class MultiDecoder:
              self.disk.stats["has_refused"] += 1          # a rank lacks it (lost, damaged, evicted there)
              return None
          size = align_up(pt.n)
@@ -598,7 +1088,23 @@ index 33dc834..83d14ba 100644
          if base is None:
              self._sync()
              return None
-@@ -1661,6 +1733,8 @@ class MultiDecoder:
+@@ -1645,9 +2032,13 @@ class MultiDecoder:
+               f"{time.perf_counter() - t:.1f}s{'' if ok else ' (not finished)'}", flush=True)
+ 
+     # -- room --------------------------------------------------------------------------------------------------------------
+-    def _used(self, x) -> int:
++    def _used(self, x, pending: bool = True) -> int:
++        """The rows of extent x in use. ``pending=False`` (XMOVE) leaves out the spill tier's waiting writes, which each
++        rank advances on its own: a cross-part move first copies their blocks to the host (``BlockStore.release``), so
++        those rows never need to travel, and what remains (kept prompts, the stream's position, a read, a pending fill)
++        is the same on every rank."""
+         used = max([len(k.ids) for k in x.kept], default=0)
+-        if self.disk is not None:                       # rows a waiting write still reads move with the extent
++        if pending and self.disk is not None:           # rows a waiting write still reads move with the extent
+             used = max([used] + [j.point.n for j in self.disk.pending if j.where is x and j.next < len(j.new)])
+         if getattr(x, "loading", None) is not None:      # a stored prompt being read into it (``_start_load``)
+             used = max(used, x.loading.n)
+@@ -1661,6 +2052,8 @@ class MultiDecoder:
          """Both ranks: relocate extent x (its used rows copied) to [base, base + size). A stored prompt being read into
          it goes on: its next blocks land at the new base, after the rows' copy (``BlockStore.moving``)."""
  
@@ -607,10 +1113,65 @@ index 33dc834..83d14ba 100644
          used = self._used(x)
          h = getattr(x, "loading", None)
          with self.disk.moving(h.lj) if h is not None and h.lj is not None else contextlib.nullcontext():
-@@ -1669,55 +1743,166 @@ class MultiDecoder:
+@@ -1669,55 +2062,221 @@ class MultiDecoder:
          if x.owner is not None:
              self.lanes[x.owner].st.bind(x.base, x.size)
  
++    def _carry(self, src: int, dst: int, n: int, kind: str) -> None:
++        """Both ranks: tokens [src, src + n) of an extent in one part into [dst, dst + n) in another (``Arena.carry``:
++        the two owners send and receive, every rank copies what it holds whole), counted for /health and, from
++        ``CARRY_LOG`` tokens, logged by rank 0. ``kind`` "admit": a request resuming from a kept state (the source stays);
++        "live": a live stream's extent on its way (``_xmove``). Waits for the transfer: both ranks are in it, rank 0
++        flushed the op that names it first. The time is the transfer's: measured by the ranks that send or receive
++        (a rank owning neither part only copies pooled keys, and would report ~0), and with three ranks or more the
++        longest of them, through one all-gather every rank joins."""
++
++        pool = self.pool
++        a, b = pool.half_of(src), pool.half_of(dst)
++        if a == b:
++            raise RuntimeError(f"rank {self.rank}: a carry from pool row {src} to {dst} stays in part {a}")
++        timed = torch.cuda.is_available() and self.rank in (a, b)
++        t0 = time.perf_counter()
++        if timed:
++            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++            e0.record()
++        self.arena.carry(src, dst, n, self.g.comm)
++        if timed:
++            e1.record()
++            e1.synchronize()
++            ms = e0.elapsed_time(e1)
++        else:
++            ms = (time.perf_counter() - t0) * 1000.0 if self.rank in (a, b) else 0.0
++        if self.w.world > 2:
++            ms = max(r[0] for r in self.g._gather_ints([int(ms * 1000)])) / 1000.0
++        c = self.carry
++        c["hits" if kind == "admit" else "live"] += 1
++        c["tokens"] += n
++        c["bytes"] += self.arena.sharded_bytes(n)
++        c["ms_total"] += ms
++        c["ms_max"] = max(c["ms_max"], ms)
++        if self.rank == 0 and n >= CARRY_LOG:
++            print(f"[tensorfold] kv shard carry ({kind}): {n} tokens, part {a} -> {b}, {ms:.1f} ms", flush=True)
++
++    def _xmove(self, x, base: int, size: int, used: int) -> None:
++        """Both ranks (XMOVE): extent x, its kept prompts with it, to [base, base + size) in ANOTHER part, its ``used``
++        rows carried (``_carry``: the source rows free as the extent leaves them; stream order puts any later writer after
++        the sends). ``used`` is rank 0's (the op carries it), counted without the spill tier's waiting writes
++        (``_used(pending=False)``): the same count on every rank, so both owners send and receive the same rows. Nothing
++        here refuses after rank 0 has emitted the op (a follower that raised would leave rank 0 in its send). The spill tier
++        first: a state of x waiting to be written still reads its rows from the old part's owner, so those blocks go to the
++        host now (``BlockStore.release``, through the pool's guard on a cross move); what is written afterwards names the
++        new part (``in_part``)."""
++
++        if x.twin or getattr(x, "loading", None) is not None:
++            raise RuntimeError(f"extent {x.eid} is a twin or being read into: it is pinned, not moved across parts")
++        if used > size:                     # (rank 0's own arguments: checked before anything is sent)
++            raise RuntimeError(f"rank {self.rank}: XMOVE of extent {x.eid} carries {used} rows of {size}")
++        old = self.pool.move(x, base, size, cross=True)
++        self._carry(old, base, used, "live")
++        if x.owner is not None:
++            self.lanes[x.owner].st.bind(x.base, x.size)
++
 +    def _untwin(self, lane: Lane) -> None:
 +        """Both ranks: the lane's twin rows back to the pool; its prompt fills on as sharded (the owner holds every row
 +        the twin did)."""
@@ -687,12 +1248,12 @@ index 33dc834..83d14ba 100644
 +            if max(free) >= need:
 +                return i
 +        return None
-+
+ 
+-    def _compact(self, grow=None) -> None:
 +    def _cheaper_half(self, need: int, protect) -> int | None:
 +        """Rank 0, with halves: the half where making ``need`` rows evicts only older kept prompts (the newest one it
 +        takes less recently used), so a placement evicts as little, and as old, as one pool would."""
- 
--    def _compact(self, grow=None) -> None:
++
 +        costs = [(c, h) for h in range(self.pool.parts) if (c := self._eviction_cost(need, protect, h)) is not None]
 +        return min(costs)[1] if costs else None
 +
@@ -790,7 +1351,7 @@ index 33dc834..83d14ba 100644
          return base
  
      def _grow(self, x, size: int, protect=()) -> bool:
-@@ -1733,15 +1918,18 @@ class MultiDecoder:
+@@ -1733,19 +2292,110 @@ class MultiDecoder:
                  self._emit(GROW, [x.eid, size])
                  self._resize(x, size)
                  return True
@@ -812,7 +1373,115 @@ index 33dc834..83d14ba 100644
              if not victims:
                  return False
              self._evict(victims[0])
-@@ -2066,6 +2254,8 @@ class MultiDecoder:
+ 
++    def _legal(self, lane: Lane, part: int) -> bool:
++        """Rank 0: whether live stream ``lane`` (in ``part``) may move now: nothing pins its rows (``_pins``) and it has
++        not moved for ``RELOCATE_HOLD`` rounds."""
++
++        return (self._pins(lane.extent) is None and lane.decoding and not lane.s.done
++                and self.xticks - lane.moved_at >= RELOCATE_HOLD)
++
++    def _move_to(self, lane: Lane, size: int) -> int | None:
++        """Rank 0: the part a live stream of ``lane``'s part would move to, for an extent of ``size`` rows: one that has
++        them free (or gathered by compacting it) plus a block for every stream it holds and the one arriving, never the
++        part the stream just left (within ``RELOCATE_HOLD`` rounds); the lightest, then the one with more free rows."""
++
++        pool = self.pool
++        p = pool.half_of(lane.extent)
++        fit = []
++        for q in range(pool.parts):
++            if q == p or (lane.came_from == q and self.xticks - lane.moved_at < RELOCATE_HOLD):
++                continue
++            want = size + ALIGN * (pool.live(q) + 1)
++            if pool.place(want, half=q) is not None or pool.compactable(q) >= want:
++                fit.append(q)
++        return min(fit, key=lambda q: (pool.live(q), -pool.free_rows(q), q)) if fit else None
++
++    def _move_lane(self, lane: Lane, size: int, q: int) -> bool:
++        """Rank 0: XMOVE ``lane``'s extent into part ``q``, ``size`` rows with the headroom ``_move_to`` found."""
++
++        pool = self.pool
++        x = lane.extent
++        p = pool.half_of(x)
++        base = self._room_free(size + ALIGN * (pool.live(q) + 1), q)
++        if base is None:
++            return False
++        used = self._used(x, pending=False)
++        if used > size:
++            return False
++        self._emit(XMOVE, [x.eid, base, size, used])
++        self._sync()                           # a carry is a collective: rank 1 holds the op before rank 0 sends
++        self._xmove(x, base, size, used)
++        lane.moved_at, lane.came_from, lane.xwhy = self.xticks, p, None
++        self.entered[q] = self.xticks
++        return True
++
++    def _relocate(self, lane: Lane) -> bool:
++        """Rank 0: a decoding stream whose extent cannot grow in its part (``_grow`` failed, so every kept prompt it
++        could evict there is gone already) would pause -- and, if every stream pauses, be given back and prefilled
++        again. Instead a stream moves whole, its kept prompts with it, to a part that has the room free (XMOVE) -- the
++        cheapest way to give it the room: of this stream and the other live streams of its part whose leaving lets it
++        grow (``_grow_fits``), the one with the fewest rows to carry, if it may move (``_legal``) and a part has the
++        room for it with headroom (``_move_to``). No stream moves out of a part another entered in the last
++        ``RELOCATE_HOLD`` rounds, nor twice in that time, nor back: moves do not answer one another. When none can,
++        it pauses as before. Refused (counted once per reason a stream, not once per round it waits) when something
++        pins its rows (``_pins``) or no move is safe; True once ``lane`` can grow."""
++
++        pool = self.pool
++        if not (KV_CARRY and pool.half):
++            return False
++        x = lane.extent
++        p = pool.half_of(x)
++        size = max(align_up(lane.st.pos + self.rows_max), x.size)
++        why = self._pins(x)
++        options = []                            # (rows to carry, 0: the stream itself, stream, extent size, part)
++        if self.xticks - self.entered.get(p, -(1 << 30)) >= RELOCATE_HOLD:
++            if why is None and self._legal(lane, p):
++                q = self._move_to(lane, size)
++                if q is not None:
++                    options.append((self._used(x, pending=False), 0, lane, size, q))
++            for m in self.lanes.values():
++                if m is lane or pool.half_of(m.extent) != p or not self._legal(m, p):
++                    continue
++                msize = max(align_up(m.st.pos + self.rows_max), m.extent.size)
++                q = self._move_to(m, msize)
++                if q is not None and self._grow_fits(x, size, free=[m.extent]):
++                    options.append((self._used(m.extent, pending=False), 1, m, msize, q))
++        for _, _, m, msize, q in sorted(options, key=lambda o: o[:2]):
++            if not self._move_lane(m, msize, q):
++                continue
++            # one carry a relocation: a bystander moved, the stream grows where it is or pauses this round as before
++            # (``_grow_fits`` only promises not to refuse a grow that works, so its yes can still fail here)
++            if m is lane or self._grow(x, lane.st.pos + self.rows_max, protect=[x]):
++                lane.xwhy = None
++                return True
++            break
++        why = why or "no_target"
++        if lane.xwhy != why:
++            self._refused(why)
++        lane.xwhy = why
++        return False
++
+     # -- iterations ---------------------------------------------------------------------------------------------------------
+     @torch.no_grad()
+     def round(self) -> list[Stream]:
+@@ -1828,8 +2478,14 @@ class MultiDecoder:
+             return [lane.s] if lane.s.done else []
+         lanes = [l for l in self.lanes.values() if l.decoding and not l.s.done]
+         t_begin = time.perf_counter()
++        self.xticks += 1
+         for l in lanes:                       # room for this round's widest window, else paused
+-            l.paused = not self._grow(l.extent, l.st.pos + self.rows_max, protect=[l.extent])
++            ok = self._grow(l.extent, l.st.pos + self.rows_max, protect=[l.extent])
++            if ok:
++                l.xwhy = None
++            elif KV_CARRY and self.pool.half:
++                ok = self._relocate(l)              # (TF_GLM_KV_SHARD: another part may have the room)
++            l.paused = not ok
+         active = [l for l in lanes if not l.paused]
+         if not active:
+             done = []
+@@ -2066,6 +2722,8 @@ class MultiDecoder:
  
          from .copy_drafts import CopyDrafts
  
@@ -821,7 +1490,7 @@ index 33dc834..83d14ba 100644
          s = lane.s
          prompt = s.prompt
          lane.decoding = True
-@@ -2355,6 +2545,8 @@ class MultiDecoder:
+@@ -2355,6 +3013,8 @@ class MultiDecoder:
              for retired in pending.retired - {sid}:
                  self._finish(retired)
          lane = self.lanes.pop(sid)
@@ -830,8 +1499,12 @@ index 33dc834..83d14ba 100644
          x = lane.extent
          x.owner = None
          self._settle(x)
-@@ -2463,6 +2655,12 @@ class MultiDecoder:
+@@ -2461,8 +3121,16 @@ class MultiDecoder:
+                 self._do_flush(p)
+             elif op == MOVE:
                  self._move(self.pool.get(p[0]), p[1], p[2])
++            elif op == XMOVE:
++                self._xmove(self.pool.get(p[0]), p[1], p[2], p[3])
              elif op == GROW:
                  self._resize(self.pool.get(p[0]), p[1])
 +            elif op == UNTWIN:
@@ -868,7 +1541,7 @@ index 474753d..be1112e 100644
              return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))
  
 diff --git tensorfold/families/glm5_next/cuda/pool.py tensorfold/families/glm5_next/cuda/pool.py
-index 2f39307..51e0f53 100644
+index 2f39307..1e917b7 100644
 --- tensorfold/families/glm5_next/cuda/pool.py
 +++ tensorfold/families/glm5_next/cuda/pool.py
 @@ -33,13 +33,20 @@ class Plane:
@@ -907,7 +1580,7 @@ index 2f39307..51e0f53 100644
              if p.tensor.shape[0] != want:
                  raise ValueError(f"a plane of {p.tensor.shape[0]} rows over {self.rows} tokens (div {p.div}, pad "
                                   f"{p.pad}): want {want}")
-@@ -77,6 +89,16 @@ class Arena:
+@@ -77,44 +89,107 @@ class Arena:
          if min(src, dst) < 0 or max(src, dst) + n > self.rows:
              raise ValueError(f"a copy of {n} tokens from {src} to {dst} reaches outside the arena's {self.rows}")
          for p in self.planes:
@@ -924,7 +1597,91 @@ index 2f39307..51e0f53 100644
              a, b = src // p.div, dst // p.div
              m = -(-n // p.div)
              m = min(m, p.tensor.shape[0] - max(a, b))
-@@ -108,13 +130,16 @@ def _move(t, a: int, b: int, m: int, spanned: bool = False) -> None:
+             _move(p.tensor, a, b, m, p.spanned)
+ 
++    def carry(self, src: int, dst: int, n: int, comm) -> None:
++        """``copy`` across parts (TF_GLM_KV_SHARD): tokens [src, src + n) of an extent in one part to [dst, dst + n)
++        in another, byte for byte (no conversion: the rows are viewed as bytes, a bf16 plane's included). What every
++        rank holds whole (the pooled keys, a last pool row still filling taken whole, the pad rows untouched) is
++        copied locally on every rank exactly as ``copy`` does; a sharded plane's rows live on the rank that owns
++        their part, so the source's owner sends them to the destination's (``shard.send_rows`` / ``recv_rows``: pieces
++        through the staging buffers, a plane in the display span by kernel on both sides, never a memcpy or a transport
++        on the span itself) and a rank that owns neither (TP3 and up) has nothing to do for them. A collective of the
++        two owners: every rank calls it with the same arguments in the same order (rank 0 flushes the op that names
++        it first, so the others are in it when it sends); the source's rows stay."""
++
++        if n <= 0:
++            return
++        if min(src, dst) < 0 or max(src, dst) + n > self.rows:
++            raise ValueError(f"a carry of {n} tokens from {src} to {dst} reaches outside the arena's {self.rows}")
++        from . import shard
+ 
+-def _move(t, a: int, b: int, m: int, spanned: bool = False) -> None:
+-    """t[b:b + m] = t[a:a + m] (rows), safe when they overlap; ``spanned``: by a kernel, not a memcpy."""
++        so, do = shard.owner(src), shard.owner(dst)
++        if so == do:                         # one part: no rows to send
++            return self.copy(src, dst, n)
++        nc = getattr(comm, "nccl", comm)
++        for p in self.planes:
++            if not p.shard:
++                a, b = src // p.div, dst // p.div
++                _move(p.tensor, a, b, min(-(-n // p.div), p.tensor.shape[0] - max(a, b)), p.spanned)
++            elif shard.RANK == so:
++                shard.send_rows(nc, do, _byte_rows(p, shard.local(src), n), p.spanned)
++            elif shard.RANK == do:
++                shard.recv_rows(nc, so, _byte_rows(p, shard.local(dst), n), p.spanned)
+ 
+-    def put(dst, src):
+-        if spanned:                        # the same bytes through an elementwise kernel
+-            import torch
++    def sharded_bytes(self, n: int) -> int:
++        """Bytes ``carry`` of ``n`` tokens sends between the two owners (the sharded planes' rows)."""
+ 
+-            torch.bitwise_or(src.view(torch.uint8), 0, out=dst.view(torch.uint8))
+-        else:
+-            dst.copy_(src)
++        return sum(n * p.tensor[0].numel() * p.tensor.element_size() for p in self.planes if p.shard)
++
++
++def _byte_rows(p: Plane, a: int, n: int):
++    """Rows [a, a + n) of sharded plane ``p`` (a row a token) as bytes [n, row bytes]: what travels, whatever the
++    cache's type (``shard.as_bytes``: a bf16 row is 1,024 bytes, an FP8 one 528)."""
++
++    import torch
++
++    if p.div != 1 or a < 0 or a + n > p.tensor.shape[0]:
++        raise ValueError(f"rows [{a}, {a + n}) of a sharded plane of {p.tensor.shape[0]} rows (div {p.div})")
++    return p.tensor[a:a + n].reshape(n, -1).view(torch.uint8)
++
++
++def put_rows(dst, src, spanned: bool = False) -> None:
++    """dst[:] = src (same shape, same bytes); ``spanned``: by a kernel, not a memcpy (the display span's two
++    registrations may not be crossed by one: rows in it never go through ``copy_`` or a transport directly)."""
++
++    if spanned:                            # the same bytes through an elementwise kernel
++        import torch
++
++        torch.bitwise_or(src.view(torch.uint8), 0, out=dst.view(torch.uint8))
++    else:
++        dst.copy_(src)
++
++
++def _move(t, a: int, b: int, m: int, spanned: bool = False) -> None:
++    """t[b:b + m] = t[a:a + m] (rows), safe when they overlap; ``spanned``: by a kernel, not a memcpy."""
+ 
+     gap = abs(a - b)
+     if gap >= m:
+-        put(t[b:b + m], t[a:a + m])
++        put_rows(t[b:b + m], t[a:a + m], spanned)
+         return
+     step = gap
+     starts = range(0, m, step) if b < a else reversed(range(0, m, step))
+     for s in starts:                       # down: front to back; up: back to front
+         k = min(step, m - s)
+-        put(t[b + s:b + s + k], t[a + s:a + s + k])
++        put_rows(t[b + s:b + s + k], t[a + s:a + s + k], spanned)
+ 
+ 
  @dataclass(eq=False)
  class Extent:
      """Pool rows [base, base + size). ``owner``: the live stream writing into it (its sid), or None; ``kept``: the
@@ -942,7 +1699,7 @@ index 2f39307..51e0f53 100644
  
      @property
      def end(self) -> int:
-@@ -128,10 +153,16 @@ class Pool:
+@@ -128,10 +203,16 @@ class Pool:
      """Extents over ``rows`` pool rows, host side only. Placement is lowest base first; every call is deterministic
      in the calls before it, so two ranks making the same calls hold the same extents."""
  
@@ -960,7 +1717,7 @@ index 2f39307..51e0f53 100644
          self.extents: list[Extent] = []           # by base
          self.next_id = 0
  
-@@ -149,24 +180,108 @@ class Pool:
+@@ -149,24 +230,108 @@ class Pool:
              at = max(at, x.end)
          if at < self.rows:
              out.append((at, self.rows - at))
@@ -1080,7 +1837,7 @@ index 2f39307..51e0f53 100644
          return nxt - x.end
  
      def get(self, eid: int) -> Extent:
-@@ -176,15 +291,18 @@ class Pool:
+@@ -176,15 +341,18 @@ class Pool:
          raise KeyError(f"no extent {eid}")
  
      # -- changes -------------------------------------------------------------------------------------------------
@@ -1102,8 +1859,16 @@ index 2f39307..51e0f53 100644
          self.next_id += 1
          self.extents.append(x)
          self.extents.sort(key=lambda y: y.base)
-@@ -209,10 +327,15 @@ class Pool:
-         base."""
+@@ -204,15 +372,21 @@ class Pool:
+             raise ValueError("an extent keeps at least one aligned block")
+         x.size = size
+ 
+-    def move(self, x: Extent, base: int, size: int | None = None) -> int:
++    def move(self, x: Extent, base: int, size: int | None = None, cross: bool = False) -> int:
+         """Place x at ``base`` (with ``size`` rows): the bookkeeping only (the caller copies the rows). Returns the old
+-        base."""
++        base. With parts, an extent stays in its own (its rank holds its latents) unless ``cross``: the caller then
++        carries the rows to the other part's rank (``Arena.carry``; ``MultiDecoder._xmove``)."""
  
          size = x.size if size is None else align_up(size, self.align)
 +        if x.twin:
@@ -1113,7 +1878,7 @@ index 2f39307..51e0f53 100644
          if any(y is not x and y.base < base + size and base < y.end for y in self.extents):
              raise ValueError(f"extent {x.eid} cannot move to [{base}, {base + size}): taken")
 +        if self.half and (self.half_of(base) != self.half_of(base + size - 1) or
-+                          self.half_of(base) != self.half_of(x)):
++                          (self.half_of(base) != self.half_of(x) and not cross)):
 +            raise ValueError(f"extent {x.eid} cannot move to [{base}, {base + size}): another half")
          old = x.base
          x.base, x.size = base, size
@@ -1175,10 +1940,10 @@ index b8361aa..afea97e 100644
              t[o + s] = r
 diff --git tensorfold/families/glm5_next/cuda/shard.py tensorfold/families/glm5_next/cuda/shard.py
 new file mode 100644
-index 0000000..093cbdb
+index 0000000..0fff09d
 --- /dev/null
 +++ tensorfold/families/glm5_next/cuda/shard.py
-@@ -0,0 +1,457 @@
+@@ -0,0 +1,544 @@
 +"""TF_GLM_KV_SHARD=1 (two ranks or more, --parallel above 1): the latent cache stored once instead of on every rank.
 +
 +The pool's rows are split in parts, one a rank (two halves at two ranks): an extent lives in one part
@@ -1204,6 +1969,11 @@ index 0000000..093cbdb
 +first ones wrote): that twin is pinned, never moved (the prompt's state points at its rows) and never counted as room,
 +and compaction goes around it. Only rows nobody holds are borrowed: a twin never evicts a kept prompt.
 +
++A conversation can change part (``Arena.carry``, TF_GLM_KV_SHARD_CARRY): a request that resumes from a kept state in a
++part that is full (or busier than another) has the state's rows sent to the owner of a part with room, instead of
++recomputing the prompt (``send_rows`` / ``recv_rows``: the same pieces and staging buffers as the prompt-chunk fetch,
++point to point between the two owners), and a live stream that cannot grow in its part moves whole the same way.
++
 +The spill tier stores what each rank holds: an extent's owner its latent and pooled-key rows, the other rank its
 +pooled keys (and each its own small state); a point records its half, and a restore goes back into it.
 +
@@ -1220,6 +1990,8 @@ index 0000000..093cbdb
 +import torch
 +import triton
 +import triton.language as tl
++
++from tensorfold.cuda.comm import _DTYPES
 +
 +ON = os.environ.get("TF_GLM_KV_SHARD", "0") == "1"
 +TRASH = 2048                      # latent rows past a half: a non-owner's writes of a decode window's rows
@@ -1578,16 +2350,14 @@ index 0000000..093cbdb
 +    gets a staging buffer [n + extra, row_bytes] whose first n rows are the fetched ones (``extra`` rows after them
 +    for the chunk's own)."""
 +
-+    from tensorfold.cuda.comm import _DTYPES
-+
 +    n = hist if isinstance(hist, int) else int(hist.numel())
 +    STATS["fetches"] += 1
 +    STATS["rows"] += n
 +    STATS["bytes"] += n * row_bytes
 +    nc = getattr(comm, "nccl", comm)
 +    peer = 1 - RANK
-+    stream = torch.cuda.current_stream().cuda_stream
-+    piece = max(1, (SEND_MIB << 20) // row_bytes)    # rows a send (both ranks cut alike: each send meets its receive)
++    stream = _stream()
++    piece = _piece(row_bytes)                        # rows a send (both ranks cut alike: each send meets its receive)
 +    if WORLD > 2:
 +        return _broadcast(nc, lc, hist, n, row_bytes, device, extra, root, piece, stream)
 +    if lc is not None:                               # gathered a piece at a time into one bounded buffer (stream order:
@@ -1595,15 +2365,99 @@ index 0000000..093cbdb
 +        for i in range(0, n, piece):
 +            k = min(piece, n - i)
 +            torch.index_select(lc, 0, hist[i:i + k], out=buf[:k])
-+            w = buf[:k].view(torch.int32)
-+            nc._check(nc.lib.ncclSend(w.data_ptr(), w.numel(), _DTYPES[torch.int32], peer, nc.comm, stream))
++            _send(nc, buf[:k], peer, stream)
 +        return None
 +    buf = _grown("comp", n + extra, row_bytes, device)[:n + extra]
 +    for i in range(0, n, piece):
 +        k = min(piece, n - i)
-+        w = buf[i:i + k].view(torch.int32)
-+        nc._check(nc.lib.ncclRecv(w.data_ptr(), w.numel(), _DTYPES[torch.int32], peer, nc.comm, stream))
++        _recv(nc, buf[i:i + k], peer, stream)
 +    return buf
++
++
++def _stream() -> int:
++    return torch.cuda.current_stream().cuda_stream
++
++
++def _piece(row_bytes: int) -> int:
++    """Rows a send carries: ``SEND_MIB`` of them (the sender's staging buffer is bounded by it)."""
++
++    return max(1, (SEND_MIB << 20) // row_bytes)
++
++
++def _send(nc, rows: torch.Tensor, peer: int, stream: int) -> None:
++    """One ncclSend of ``rows`` [k, row bytes] (bytes, a multiple of 4 a row) to rank ``peer``."""
++
++    w = rows.view(torch.int32)
++    nc._check(nc.lib.ncclSend(w.data_ptr(), w.numel(), _DTYPES[torch.int32], peer, nc.comm, stream))
++
++
++def _recv(nc, rows: torch.Tensor, peer: int, stream: int) -> None:
++    """The matching ncclRecv into ``rows`` [k, row bytes] from rank ``peer``."""
++
++    w = rows.view(torch.int32)
++    nc._check(nc.lib.ncclRecv(w.data_ptr(), w.numel(), _DTYPES[torch.int32], peer, nc.comm, stream))
++
++
++def warm(comm, device) -> None:
++    """TP3 and up, once at start (every rank, at the same point): every pair of ranks sends 16 bytes each way, so NCCL
++    makes its point-to-point connections now and not at the first carry mid-serve (a connection's setup blocks the host
++    and allocates buffers). The pairs go in the same order on every rank (a < b, by a then b): a sends first and
++    receives, b receives first and sends, so each call meets its partner's; a rank outside a pair goes on to the next."""
++
++    if WORLD < 3:
++        return
++    nc = getattr(comm, "nccl", comm)
++    stream = _stream()
++    out = torch.zeros((1, 16), dtype=torch.uint8, device=device)
++    got = torch.empty((1, 16), dtype=torch.uint8, device=device)
++    for a in range(WORLD):
++        for b in range(a + 1, WORLD):
++            if RANK == a:
++                _send(nc, out, b, stream)
++                _recv(nc, got, b, stream)
++            elif RANK == b:
++                _recv(nc, got, a, stream)
++                _send(nc, out, a, stream)
++    if torch.cuda.is_available():
++        torch.cuda.synchronize(device)
++
++
++def send_rows(nc, peer: int, rows: torch.Tensor, spanned: bool = False) -> None:
++    """``rows`` [n, row bytes] (a latent plane's rows of an extent, as bytes) to rank ``peer``, which calls
++    ``recv_rows`` with the same row count and size: a piece (``SEND_MIB``) at a time through the sender's staging
++    buffer (the one ``fetch`` gathers into: stream order ends a piece's send before the next copy overwrites it).
++    ``spanned``: the plane lies in the display span, whose two registrations a memcpy (or a transport reading it)
++    may not cross: the rows reach the staging buffer by kernel, as ``Arena.copy`` moves them (``pool.put_rows``);
++    only rank ``peer`` and this rank call, a rank that owns neither part does not (TP3 and up)."""
++
++    from .pool import put_rows
++
++    n, rb = rows.shape
++    piece = _piece(rb)
++    buf = _grown("send", min(n, piece), rb, rows.device)
++    stream = _stream()
++    for i in range(0, n, piece):
++        k = min(piece, n - i)
++        put_rows(buf[:k], rows[i:i + k], spanned)
++        _send(nc, buf[:k], peer, stream)
++
++
++def recv_rows(nc, peer: int, rows: torch.Tensor, spanned: bool = False) -> None:
++    """The receiving half of ``send_rows``: rank ``peer``'s rows into ``rows`` [n, row bytes] (a view of this rank's
++    plane), a piece at a time through the staging buffer ``fetch`` receives into (``comp``: a fetch's copy of the
++    history lives only inside the layer that asked for it, never across the carry that runs between iterations);
++    the rows reach the plane by kernel when ``spanned``."""
++
++    from .pool import put_rows
++
++    n, rb = rows.shape
++    piece = _piece(rb)
++    buf = _grown("comp", min(n, piece), rb, rows.device)
++    stream = _stream()
++    for i in range(0, n, piece):
++        k = min(piece, n - i)
++        _recv(nc, buf[:k], peer, stream)
++        put_rows(rows[i:i + k], buf[:k], spanned)
 +
 +
 +def _broadcast(nc, lc, hist, n: int, row_bytes: int, device, extra: int, root: int, piece: int, stream):
@@ -1611,8 +2465,6 @@ index 0000000..093cbdb
 +    it into its compact copy."""
 +
 +    import ctypes
-+
-+    from tensorfold.cuda.comm import _DTYPES
 +
 +    if root is None or int(root) < 0:      # (a caller that names no owner, as the MTP layer's dsa_block, would
 +        raise ValueError(                  # broadcast from rank -1)
