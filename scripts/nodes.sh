@@ -96,6 +96,17 @@ settle_memory() {
   done
   echo "${a0:--} ${a:--} $(( SECONDS - t0 )) $h0 ${h:--} $late"
 }
+# _avail_gb: whole GiB available here, what `free -g` shows in its "available" column plus the parked pages over their
+# resting level (_settle_zone's parked less its resting KiB, which includes 256 MiB of slack: it undercounts a little,
+# never overcounts), the figure TensorFold's budget starts from (patch 0119). Runs on the workers too.
+_avail_gb() {
+  local pg a z h rest
+  pg=$(getconf PAGESIZE 2>/dev/null || echo 4096)
+  a=$(_settle_avail)
+  [[ -n "$a" ]] || { free -g | awk '/^Mem:/ {print $7}'; return; }
+  z=$(_settle_zone "$pg"); read -r h rest <<<"$z"
+  echo $(( (a + (${h:-0} > ${rest:-0} ? h - rest : 0)) / 1048576 ))
+}
 _settle_gib() { awk -v k="$1" 'BEGIN { if (k == "-") print "?"; else printf "%.1f", k / 1048576 }'; }
 # settle_memory_all <max seconds>: settle_memory on every node at once; says once that it is waiting, then what it
 # waited for

@@ -103,6 +103,13 @@ load $(steps 4194304 -262144 20)
 rc=0; OUT=$(set -euo pipefail; settle_memory_all 0) || rc=$?
 check "MEMORY_SETTLE_TIMEOUT=0: skipped" '[[ $rc == 0 && -z "$OUT" ]]'
 
+echo "_avail_gb (start.sh's free-memory figure counts the parked excess)"
+printf 'MemAvailable:   100000000 kB\n' > "$SETTLE_MEMINFO"          # 95.4 GiB
+zone 8388608;  check "8 GiB parked: 95 + (8 GiB less the resting level) = 103" '[[ $(_avail_gb) == 103 ]]'
+zone 100000;   check "parked under the resting level: MemAvailable alone, 95" '[[ $(_avail_gb) == 95 ]]'
+zone none;     check "no page lists: MemAvailable alone, 95" '[[ $(_avail_gb) == 95 ]]'
+rm -f "$SETTLE_ZONEINFO"; check "zoneinfo missing: 95, no error under errexit" '[[ $(set -euo pipefail; _avail_gb) == 95 ]]'
+
 echo
 if (( fails )); then echo "$fails check(s) FAILED"; exit 1; fi
 echo "all checks passed"

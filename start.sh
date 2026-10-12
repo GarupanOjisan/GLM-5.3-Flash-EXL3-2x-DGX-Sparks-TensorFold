@@ -286,11 +286,12 @@ fi
 # With less, rank 0 refuses the window and names one that fits, which the load below then starts again with.
 # Memory freed in bulk a moment ago (prepare.sh's image copy) is not in MemAvailable yet, and TensorFold sizes its
 # pool from MemAvailable when it starts: wait until it is back (scripts/nodes.sh).
+# What is still parked counts as available below (patch 0119 makes TensorFold's budget count it too).
 (( DRY )) || settle_memory_all "$MEMORY_SETTLE_TIMEOUT"
-here_gb=$(free -g | awk '/^Mem:/ {print $7}')
+here_gb=$(_avail_gb)
 low=0; (( here_gb >= 110 )) || low=1
 for i in $(worker_ids); do
-  there_gb[i]=$(worker "$i" "free -g | awk '/^Mem:/ {print \$7}'" 2>/dev/null || echo 0)
+  there_gb[i]=$(worker "$i" "$(declare -f _settle_zone _settle_avail _avail_gb); _avail_gb" 2>/dev/null || echo 0)
   (( there_gb[i] >= 110 )) || low=1
 done
 if (( ! low )); then
