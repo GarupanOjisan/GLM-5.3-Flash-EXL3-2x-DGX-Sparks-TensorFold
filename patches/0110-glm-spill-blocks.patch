@@ -11,10 +11,10 @@
 # for issue #122, reported by @xiepengqi; the rest by @wojo. Builds on 0088-glm-spill-tier. Apache-2.0.
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
 new file mode 100644
-index 0000000..4d20974
+index 0000000..30b9cbe
 --- /dev/null
 +++ tensorfold/cuda/spill_blocks.py
-@@ -0,0 +1,1701 @@
+@@ -0,0 +1,1714 @@
 +"""The spill tier's block store for a shared pool of cache rows (``tensorfold serve --spill-gib`` with several streams):
 +every kept prompt state is written to this rank's disk when it is kept, so it survives an eviction, a restart and a
 +crash, and a later request that extends the same tokens reads it back instead of prefilling them.
@@ -96,9 +96,11 @@ index 0000000..4d20974
 +
 +FORMAT = "tensorfold-cuda-spill-blocks-1"
 +READERS = 8                    # blocks read at once on a load (cold NVMe reads scale with the reads in flight)
-+READ_BLOCKS = 32               # TF_GLM_SPILL_READ_BLOCKS: blocks loads read ahead into pinned slots (GLM on two
-+                               # Sparks: 12.1 MiB a block, 388 MiB): a slot is free again only once the engine copied it
-+                               # out, between rounds, so beside a decoding stream a load moves at most this many a round
++READ_BLOCKS = 16               # TF_GLM_SPILL_READ_BLOCKS: blocks loads read ahead into pinned slots (GLM on two
++                               # Sparks: 12.1 MiB a block; spill.preallocate's read buffers hold the first ten, the rest
++                               # comes out of the pool, about 14k tokens at PARALLEL=4; 9 costs it nothing): a slot is
++                               # free again only once the engine copied it out, so beside a decoding stream a load moves
++                               # at most this many a round (pin_read_ahead)
 +STAGE_MIB = 256                # TF_GLM_SPILL_STAGE_MIB: the pinned ring writes go through (at least two blocks)
 +
 +
@@ -109,14 +111,25 @@ index 0000000..4d20974
 +
 +
 +def pin_read_ahead(block_bytes: int) -> int:
-+    """The engine, before it sizes its pool from the memory left: the read-ahead's pinned slots, ``read_blocks()`` of
-+    ``block_bytes`` each (in place of ``spill.preallocate``'s read buffers), so the pool gets what they leave instead
-+    of their coming out of the margin it keeps. The bytes pinned."""
++    """The engine, before it sizes its pool from the memory left: room for ``read_blocks()`` blocks of ``block_bytes``
++    (the engine's bytes a pool block, at least a stored block's) read ahead. ``spill.preallocate``'s read buffers,
++    pinned before the engine read its free memory, hold the first of them; the rest is pinned now in pieces of a power
++    of two bytes, at most ``spill.CHUNK`` each: torch's pinned allocator rounds every allocation up to a power of two,
++    so a 12.1 MiB slot alone would hold 16 MiB, and eleven in one allocation 256 MiB. ``ring`` carves every whole
++    stored block out of them. The bytes pinned now, which the pool pays for (the preallocated ones came out of the
++    margin, as the write buffers do)."""
 +
 +    per = _up(block_bytes)
++    bufs = _sp._PINNED.setdefault("read", [])
++    want = read_blocks() * per - sum(b.numel() for b in bufs)
 +    pin = torch.cuda.is_available()
-+    _sp._PINNED["read"] = [torch.empty(per, dtype=torch.uint8, pin_memory=pin) for _ in range(read_blocks())]
-+    return per * read_blocks()
++    took = 0
++    while want > 0:
++        size = 1 << (max(min(want, _sp.CHUNK), per) - 1).bit_length()
++        bufs.append(torch.empty(size, dtype=torch.uint8, pin_memory=pin))
++        took += size
++        want -= size
++    return took
 +
 +
 +def _count(name: str, default: int, unit: str) -> int:

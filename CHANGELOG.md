@@ -148,15 +148,17 @@ Every change to this recipe, newest first. Each release names the image it serve
   [PR #118](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/118) by
   [BadAd84](https://github.com/BadAd84), brought into the spill tier so there is one tier and one set of settings. The
   one-stream engine (`PARALLEL=1`) keeps its file a state. `SPILL_HIGHWATER` no longer changes anything.
-  A restore reads ahead on 8 threads into pinned slots (`TF_GLM_SPILL_READ_BLOCKS`, 32) and the engine copies the
+  A restore reads ahead on 8 threads into pinned slots (`TF_GLM_SPILL_READ_BLOCKS`, 16) and the engine copies the
   blocks read between rounds (`TF_GLM_SPILL_LOAD_MS`, 40 ms, one budget for every restore in flight, each first in
   turn; beside decoding streams a restore ends only once those copies are done, rather than its end copying the
   read-ahead in one pause), as #118 does: issued from the reader's own thread, each
   copy waited on the decode loop (~0.25 ms a call against ~9 us idle), so a 260k-token restore beside a decoding stream
   took 1.0-1.3 s on two Sparks and 8.6-12.7 s on three (measured by [BadAd84](https://github.com/BadAd84)); now
-  0.54-0.61 s (idle 0.40-0.46 s), the same replies. The read-ahead (388 MiB on two Sparks) is pinned before the
-  pool is sized, so it comes out of the pool (~60k tokens), not the margin it keeps. The write ring's size is
-  `TF_GLM_SPILL_STAGE_MIB` (256 MiB). A restore whose read fails on one Spark (a damaged or missing block) ends on every Spark and the
+  0.54-0.61 s with 32 blocks read ahead (idle 0.40-0.46 s), the same replies. The read-ahead's first blocks go in the
+  two 64 MiB read buffers pinned at start (ten blocks on two Sparks); the rest is pinned before the pool is sized, in
+  power-of-two pieces, so that comes out of the pool, not the margin it keeps (the default 16 blocks: ~14k tokens at
+  `PARALLEL=4`; 9 costs the pool nothing). The write ring's size is `TF_GLM_SPILL_STAGE_MIB` (256 MiB). A restore
+  whose read fails on one Spark (a damaged or missing block) ends on every Spark and the
   prompt is computed again: a Spark with more blocks left than read slots (above ~65k tokens) waited for ever for the
   slots its own copies held (a ~100k-token conversation with damaged blocks on two Sparks: the request hung until the
   client gave up after 15 minutes; now answered in 50 s, its prompt recomputed). CPU check: `hang` in
