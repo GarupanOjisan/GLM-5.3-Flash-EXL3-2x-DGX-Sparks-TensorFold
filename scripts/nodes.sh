@@ -61,12 +61,17 @@ worker_save_log() {
 # the image copy in prepare.sh (`docker save` / `docker load`) parks 5-9 GiB there for 1-2 minutes: the "count:" lines
 # under "pagesets" in /proc/zoneinfo, in neither MemFree nor MemAvailable. Runs on the workers too (the two helpers
 # below are sent over ssh with it): no config.sh there.
-# _parked_zone <page size>: "<parked KiB> <resting KiB>" from the per-CPU page lists, empty when there are none. The
-# resting level is the lists' high_min plus 256 MiB of slack (512 MiB when high_min is not listed): it undercounts a
-# little, never overcounts.
+# _parked_zone <page size>: "<parked KiB> <resting KiB>" from the per-CPU page lists, empty when there are none or a
+# value is not a number. Only the count: and high_min: lines under a zone's "pagesets" count, as in the engine
+# (capacity.parked_bytes in patch 0119). The resting level is the lists' high_min plus 256 MiB of slack (512 MiB when
+# high_min is not listed): it undercounts a little, never overcounts.
 _parked_zone() {
-  awk -v pg="$1" '/^ +count:/ { c += $2; n++ } /^ +high_min:/ { m += $2; k++ }
-    END { if (n) print int(c * pg / 1024), (k ? int(m * pg / 1024) + 262144 : 524288) }' \
+  awk -v pg="$1" '{ t = $0; gsub(/^[ \t]+|[ \t]+$/, "", t) }
+    t == "pagesets" { l = 1; next }
+    l && substr($0, 1, 4) != "    " && $0 !~ /^  vm stats/ { l = 0 }
+    l && $1 == "count:" { if ($2 !~ /^[0-9]+$/) bad = 1; c += $2; n++ }
+    l && $1 == "high_min:" { if ($2 !~ /^[0-9]+$/) bad = 1; m += $2; k++ }
+    END { if (n && !bad) print int(c * pg / 1024), (k ? int(m * pg / 1024) + 262144 : 524288) }' \
     /proc/zoneinfo 2>/dev/null || true
 }
 _mem_avail() { awk '/^MemAvailable:/ { print $2 }' /proc/meminfo 2>/dev/null || true; }

@@ -286,11 +286,11 @@ reserve also sets the lowest free memory.
 TensorFold reads `MemAvailable` once, when it starts. The image copy in `prepare.sh` (`docker save` on the head,
 `docker load` on the worker) frees tens of GiB of page cache at once, and the kernel parks 5-9 GiB of it on its per-CPU
 free lists (the `count:` lines under `pagesets` in `/proc/zoneinfo`), in neither `MemFree` nor `MemAvailable`; it comes
-back at ~0.1 GiB/s over the next 1-2 minutes, and the first start of a new image also parks 2.4 GiB compiling its kernels
-a second before the budget is read. A first start used to land in that window: 89.4 GiB budgeted on rank 0 where the
-second start got 94-95, which cut the kept prompt states from 32 to 2 and shrank the pool. Patch `0119` makes the
+back at ~0.05-0.1 GiB/s over the next 1-2 minutes, and the first start of a new image also parks 2.4 GiB compiling its kernels
+a second before the budget is read. A first start used to land in that window: 89.44 GiB budgeted on rank 0 where a
+warm restart got 94.86, which cut the kept prompt states from 32 to 2 and shrank the pool. Patch `0119` makes the
 engine count the pages parked above the lists' resting level (read once, at start-up, and logged), so the first start
-budgets 94.6 GiB; `start.sh`'s ~110 GiB check counts them too.
+budgets 94.58 GiB (rank 1 95.20); `start.sh`'s ~110 GiB check counts them too.
 
 The GB10 firmware also keeps about 2 GiB for a screen, which a headless Spark never uses and `MemAvailable` never
 counts. With `PARALLEL` above 1, `DISPLAY_KV_MIB=1792` (patch 0072) adds that much of it to the pool on every rank, on

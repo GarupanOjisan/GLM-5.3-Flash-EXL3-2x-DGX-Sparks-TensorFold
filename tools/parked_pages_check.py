@@ -12,10 +12,15 @@ Synthetic /proc/zoneinfo and /proc/meminfo files (capacity.ZONEINFO / MEMINFO po
 page lists on several CPUs, zones and nodes (only the ``count:`` lines under ``pagesets`` are summed, less their
 ``high_min:`` lines: the excess over the resting level), a warm start's lists (counts ~0), lists without high_min
 (the first 512 MiB are resting), zones without lists, no lists at all, an unreadable or garbled file (0, never an
-error), and the figures the startup budget reads (``available_bytes`` / ``page_room`` given ``parked``, on a unified and
-on a discrete GPU), which a live caller that passes none does not see. Exit code 1 when a check fails, and on an
+error), and the figures the startup budget reads (``available_bytes`` / ``page_room`` given the one counted reading, on a
+unified and on a discrete GPU), which a live caller that passes none does not see. ``admit()`` itself, with a stub torch,
+a tiny config.json, no weights and a constant geometry: its budget with and without parked pages, ``/proc/meminfo``
+read before the lists (and pages draining between the reads never counted twice), and the 0.25 GiB log line. Exit code 1 when a check fails, and on an
 image without the patch.
 """
+import contextlib
+import io
+import json
 import os
 import re
 import sys
@@ -23,7 +28,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace as NS
 
-from tensorfold.cuda import capacity
+from tensorfold.cuda import build, capacity
 
 GIB, KIB = 1024**3, 1024
 PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -59,23 +64,23 @@ def parked():
 
 
 def run(zoneinfo, meminfo, torch=None, zone_path=None):
-    """The figures the startup budget reads with those files in place of /proc's: ``avail`` and ``room`` get the parked
-    bytes as admit() passes them; ``live`` is available_bytes as the live gates call it, with none."""
+    """The figures the startup budget reads with those files in place of /proc's: ``info`` is the one reading admit()
+    passes to ``avail`` (available_bytes) and ``room`` (page_room); ``live`` is available_bytes as the live gates call it,
+    with no reading."""
     d = Path(tempdir.name)
     if zoneinfo is not None:
         (d / "zoneinfo").write_text(zoneinfo)
     (d / "meminfo").write_text(meminfo)
     capacity.ZONEINFO = zone_path or str(d / "zoneinfo")
     capacity.MEMINFO = str(d / "meminfo")
-    p = parked()
-    try:
-        return NS(parked=p, info=capacity._meminfo(p or 0), plain=capacity._meminfo(),
-                  avail=capacity.available_bytes(torch, p or 0) if torch else None,
-                  room=capacity.page_room(torch, p or 0) if torch else None,
-                  live=capacity.available_bytes(torch) if torch else None)
-    except TypeError:                                                  # an image without the patch: no such arguments
-        plain, live = capacity._meminfo(), capacity.available_bytes(torch) if torch else None
+    p, plain = parked(), capacity._meminfo()
+    live = capacity.available_bytes(torch) if torch else None
+    if not hasattr(capacity, "counting"):                              # an image without the patch: no such argument
         return NS(parked=p, info=plain, plain=plain, avail=live, room=capacity.page_room(torch) if torch else None, live=live)
+    info = capacity.counting(plain, p or 0)
+    return NS(parked=p, info=info, plain=plain, live=live,
+              avail=capacity.available_bytes(torch, info) if torch else None,
+              room=capacity.page_room(torch, info) if torch else None)
 
 
 def fake(integrated, free=0, total=0):
@@ -110,7 +115,7 @@ check("MemTotal is the file's", r.info["MemTotal"] == 128 * GIB)
 check("available_bytes (unified GPU) is MemAvailable + excess - the 10 % reserve",
       r.avail == 100 * GIB + excess - reserve, f"{r.avail}")
 check("page_room (unified GPU) is MemAvailable + excess", r.room == 100 * GIB + excess)
-check("a live caller (no parked argument) keeps MemAvailable", r.live == 100 * GIB - reserve and
+check("a live caller (no reading passed) keeps MemAvailable", r.live == 100 * GIB - reserve and
       r.plain["MemAvailable"] == 100 * GIB)
 r = run(text, MEM, discrete)
 check("a discrete GPU is bounded by the smaller of both: here its own free memory",
@@ -175,6 +180,89 @@ check("MemAvailable is capped at MemTotal", r.info["MemAvailable"] == 128 * GIB)
 # a /proc/meminfo that lacks a field is still unusable, and unreadable ones too
 check("meminfo without MemAvailable: None", run(text, "MemTotal: 1 kB\n").info is None)
 check("meminfo that is not numbers: None", run(text, "MemTotal: x kB\nMemAvailable: 1 kB\n").info is None)
+
+# admit() itself: the budget it plans from, the order of its two reads, and its log line. A stub torch, a tiny
+# config.json, no weights and a constant geometry; ``calls`` records the reads, ``then`` swaps the files after the first
+model = Path(tempdir.name) / "model"
+model.mkdir()
+(model / "config.json").write_text(json.dumps({"max_position_embeddings": 4096}))
+real = {name: getattr(capacity, name) for name in ("floor", "estimate_weights", "make_plan", "_meminfo", "parked_bytes")}
+real_refuse = build.refuse_old_gpu
+build.refuse_old_gpu = lambda *args, **kwargs: None
+capacity.floor = lambda directory: (0, 0)
+capacity.estimate_weights = lambda *args, **kwargs: capacity.Weights(0, 0)
+calls, plans, after = [], [], []
+
+
+def recording(name):
+    def read(*args, **kwargs):
+        calls.append(name)
+        value = real[name](*args, **kwargs)
+        if len(calls) == 1 and after:
+            write(*after[0])                                     # pages drain right after the first read
+        return value
+    return read
+
+
+def write(zoneinfo, meminfo_text):
+    d = Path(tempdir.name)
+    (d / "zoneinfo").write_text(zoneinfo)
+    (d / "meminfo").write_text(meminfo_text)
+    capacity.ZONEINFO, capacity.MEMINFO = str(d / "zoneinfo"), str(d / "meminfo")
+
+
+def planning(*args, **kwargs):
+    plans.append(real["make_plan"](*args, **kwargs))
+    return plans[-1]
+
+
+capacity._meminfo, capacity.parked_bytes, capacity.make_plan = recording("_meminfo"), recording("parked_bytes"), planning
+
+
+def start(zoneinfo, meminfo_text, drained=None, torch=unified):
+    """admit() on those files; ``drained`` is what the files become after its first read. Sets the budget, its output and
+    the order in which it read."""
+    calls.clear(), plans.clear(), after.clear()
+    write(zoneinfo, meminfo_text)
+    if drained:
+        after.append(drained)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        capacity.admit(model, None, None, torch, capacity.Geometry(lambda slots: 0, 0), None)
+    return NS(budget=plans[0].budget, out=out.getvalue(), calls=list(calls),
+              line=[row for row in out.getvalue().splitlines() if "budget counts" in row])
+
+
+six_gib = zone(0, "Normal", [HIGH_MIN + 6 * GIB // PAGE])
+cold = start(six_gib, meminfo(128, 90))
+bare = start(no_lists, meminfo(128, 90))
+check("admit: no pages parked, the budget is MemAvailable less the reserve", bare.budget == 90 * GIB - reserve, f"{bare.budget}")
+check("admit: 6 GiB parked over the resting level raise the budget by 6 GiB",
+      cold.budget == 96 * GIB - reserve, f"{cold.budget}")
+check("admit: it reads /proc/meminfo, then the page lists, once each", cold.calls == ["_meminfo", "parked_bytes"], f"{cold.calls}")
+check("admit: the start-up line names the GiB counted",
+      len(cold.line) == 1 and "counts the 6.00 GiB" in cold.line[0], f"{cold.line}")
+check("admit: the line is absent when nothing is parked", bare.line == [])
+# the lists drain between the two reads: MemAvailable read first can only undercount, never count the pages twice
+drain = (no_lists, meminfo(128, 96))
+raced = start(six_gib, meminfo(128, 90), drained=drain)
+check("admit: pages draining between the reads are never counted twice",
+      raced.budget <= 96 * GIB - reserve, f"{raced.budget} > {96 * GIB - reserve}")
+check("admit: ... and that undercount is MemAvailable as first read", raced.budget == 90 * GIB - reserve, f"{raced.budget}")
+# the line's threshold: 0.25 GiB
+quarter = GIB // 4 // PAGE
+for label, extra, shown in (("0.25 GiB over", quarter, True), ("just under 0.25 GiB", quarter - 1, False),
+                            ("a warm start's 0.11 GiB", 1440 * 20, False)):
+    r = start(zone(0, "Normal", [HIGH_MIN + extra]), meminfo(128, 90))
+    check(f"admit: {label}: the line is {'printed' if shown else 'absent'}", bool(r.line) == shown, f"{r.line}")
+check("admit: the line names 0.25 GiB at the threshold",
+      bool(start(zone(0, "Normal", [HIGH_MIN + quarter]), meminfo(128, 90)).line) and
+      "counts the 0.25 GiB" in start(zone(0, "Normal", [HIGH_MIN + quarter]), meminfo(128, 90)).line[0])
+nolines = start(no_lists, meminfo(128, 90))
+check("admit: no page lists: budget as MemAvailable less the reserve, no line",
+      nolines.budget == 90 * GIB - reserve and nolines.line == [])
+capacity.__dict__.update({name: real[name] for name in real})
+build.refuse_old_gpu = real_refuse
 
 # this host's real file, when it has page lists in a layout this can read (any indentation): the answer is a figure
 # between nothing and every parked page, and near an independent reading of the same file (the lists move between the
