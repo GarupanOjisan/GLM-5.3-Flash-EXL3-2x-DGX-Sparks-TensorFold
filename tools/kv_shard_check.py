@@ -162,6 +162,8 @@ class Real(Stub):
     _move = multi.MultiDecoder._move; _used = multi.MultiDecoder._used; _untwin = multi.MultiDecoder._untwin
     fits = multi.MultiDecoder.fits; _need = multi.MultiDecoder._need
     _shard_health = getattr(multi.MultiDecoder, "_shard_health", None)
+    _pinned = getattr(multi.MultiDecoder, "_pinned", None)
+    _revoke = multi.MultiDecoder._revoke_twins
     def __init__(self, rows, half):
         super().__init__(rows, half); self.rank = 0; self.disk = None; self.rows_max = 2048; self.ops = []
         self.arena = SimpleNamespace(copy=lambda a, b, n: None)
@@ -301,8 +303,9 @@ def fits_parts():
     s = Real(2 * H, H)
     x = s.pool.add(0, 20 * A); x.owner = 1
     t, lane = twin(s, H + 12 * A, 20 * A, x)
-    s.pool.add(H, 12 * A).owner = 2; lanes(s)
-    check("9 fits: a twin's rows are not evictable room", s.fits(SimpleNamespace(prompt=[0] * need_prompt)) is False)
+    s.pool.add(H, 12 * A).owner = 2; lanes(s); s.lanes[1] = lane
+    s.partial = SimpleNamespace(contains=lambda sid: sid == 1, group=[(lane, 20 * A)])      # (its fill is in flight)
+    check("9 fits: a pinned twin's rows are not evictable room", s.fits(SimpleNamespace(prompt=[0] * need_prompt)) is False)
     # (d) decoding streams in the part need headroom
     s = Real(2 * H, H)
     s.pool.add(0, 24 * A).owner = 1; s.pool.add(H, 24 * A).owner = 2; lanes(s)
@@ -316,6 +319,30 @@ def fits_parts():
     check("9 fits: one pool as before", s.fits(SimpleNamespace(prompt=[0] * (20 * A))) is True
           and s.fits(SimpleNamespace(prompt=[0] * (30 * A))) is False)
 section("9 fits", fits_parts)
+
+def fits_revocable_twin():
+    # the re-review's case: a 30A prompt between chunks of its fill (no slice in flight) in part 0, its 30A twin in
+    # part 1. The twin can be given back, so a 10A request fits (the scheduler holds a request fits() refuses and
+    # nothing calls _room, so a twin counted as pinned would hold it for the other prompt's whole fill)
+    def build(pending):
+        s = Real(2 * H, H)
+        x = s.pool.add(0, 30 * A); x.owner = 1
+        t, lane = twin(s, H, 30 * A, x)
+        if pending:
+            s.partial = SimpleNamespace(contains=lambda sid: sid == 1, group=[(lane, 30 * A)])
+        return s, x, t, lane
+    prompt = SimpleNamespace(prompt=[0] * (8 * A))
+    s, x, t, lane = build(False)
+    check("9 fits: a twin between chunks is room (it is given back)", s.fits(prompt) is True)
+    if s._shard_health is not None:
+        check("9 health: its rows count as gatherable room", s._shard_health()["parts"][1]["gatherable"] == H)
+    base = s._room(s._need(8 * A))
+    check("9 fits: and _room does place it, after one UNTWIN", base is not None and lane.twin is None
+          and [op for op, _ in s.ops].count(multi.UNTWIN) == 1)
+    s, x, t, lane = build(True)
+    check("9 fits: a twin of the fill part way through its layers is not room", s.fits(prompt) is False)
+    check("9 fits: and _room refuses it too, keeping the twin", s._room(s._need(8 * A)) is None and lane.twin is not None)
+section("9 fits revocable twin", fits_revocable_twin)
 
 def grow_twin():
     s = Real(2 * H, H)
