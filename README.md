@@ -11,6 +11,29 @@
   <img src=".github/image.png" alt="GLM-5.3 Flash EXL3 on TensorFold, Dual DGX Sparks" width="100%">
 </p>
 
+> [!NOTE]
+> **This is [wojo](https://github.com/wojo)'s fork of [Mia's recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold),
+> published while four of its pull requests wait to be merged upstream.** It is the upstream recipe plus those patches,
+> with KV sharding and the newer spill tier **on by default**. It is what I run every day on my own two Sparks.
+> Unofficial: report problems with these patches here or on their pull requests, not to Mia's AI Lab.
+>
+> | What it adds | Pull request | Measured on two Sparks |
+> |---|---|---|
+> | **KV sharding** (`0118`): each conversation's cache stored once, on the Spark that owns it, instead of on both. A conversation resuming where its Spark is full is carried to the other one (~70 ms at 205k tokens) instead of computed again (~93 s) | [#152](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/152) | ~1.9x the tokens in the same memory: 1.51M -> 2.83M (`PARALLEL=8`, mine), 2.25M -> 4.03M (`PARALLEL=4`, @SvangenStudios' pair on kernel 7.0). Replies byte-equal to unsharded, decode within 1% |
+> | **Spill tier v2** (`0110`): every kept conversation written to NVMe when it's kept, in blocks later turns share, so it survives eviction, a restart, `kill -9` or a watchdog restart | [#124](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124) (with @BadAd84) | a 40k-token conversation back 1.45 s after `kill -9` (21.6 s fresh) |
+> | **A shared system prompt prefilled once** (`0110`, `PREFIX_WAIT`): agents starting together on a new system prompt wait for the first one's state instead of each prefilling it | [#124](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124) | 6 agents on a fresh 12k-token prompt: ~15 s instead of ~47 s, same replies |
+> | **Full pool on the first start of a new image** (`0119`) | [#149](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/149) | budget 94.6 GiB instead of 89.4 (the first start used to lose 5-9 GiB of it) |
+> | **A rewound conversation keeps its id** (`0111`), so per-conversation limits count it once | [#128](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/128) | |
+>
+> **Switching from upstream:** clone this repository, copy your `scripts/local.sh` (and `.env`) across, and run
+> `./start.sh`. The first start builds the image locally (no image is published for this patch set). Spill needs
+> about 64 GiB free on each Spark's NVMe, plus 50 GiB it always leaves free (`SPILL_GIB=0` turns it off;
+> `TF_GLM_KV_SHARD=0` turns sharding off). Everything else, including 4 streams, is upstream's default. As each pull
+> request is merged upstream, this fork drops its copy.
+>
+> Thanks to Mia's AI Lab for the recipe, to @BadAd84 for the spill tier's block design and read-ahead, and to
+> @SvangenStudios for testing sharding on a second pair of Sparks.
+
 Serve **GLM-5.3-Flash** from two NVIDIA DGX Sparks (GB10, 128 GB each, linked by their ConnectX-7 ports) through an
 OpenAI-compatible API, with **4 concurrent requests**, the model's full **1,048,576-token context** and **image and
 video input**. It runs [TensorFold](https://github.com/ashhart/TensorFold) v0.6.0 on both Sparks (one rank on each)

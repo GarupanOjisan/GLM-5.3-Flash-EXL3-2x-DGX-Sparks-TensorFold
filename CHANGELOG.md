@@ -5,6 +5,11 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **wojo fork defaults**: KV sharding (`TF_GLM_KV_SHARD=1` at two Sparks with more than one stream) and the spill tier
+  (`SPILL_GIB=64`, `SPILL_QUOTA=0.25`) are on by default in this fork, as dogfooded since 2026-10-09; CI's image-pin
+  check is a warning (no image is published for this patch set: `start.sh` builds it locally). README: the note at
+  the top.
+
 - **KV sharding** (patch `0118-glm-kv-shard`, `TF_GLM_KV_SHARD=1`, off by default, by
   [wojo](https://github.com/wojo)): each conversation's MLA latent cache is stored once, on the Spark that owns it,
   instead of on every Spark (tensor parallelism splits the heads, but every head reads the whole latent). The owner
