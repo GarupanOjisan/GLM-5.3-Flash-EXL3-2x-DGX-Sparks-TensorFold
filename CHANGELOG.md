@@ -15,7 +15,9 @@ Every change to this recipe, newest first. Each release names the image it serve
   while its prompt fills (a compaction moving it gave wrong replies under concurrent load; found in review, fixed, and
   a forced-compaction run on two Sparks is byte-equal). A cache hit whose part has no room no longer drops the cache
   or evicts kept conversations while another part has room: its rows are carried there (`TF_GLM_KV_SHARD_CARRY`,
-  on; only when it saves a recompute, an eviction or a pause, never to even out the parts). Builds on `0110` and
+  on; only when it saves a recompute, an eviction or a pause, never to even out the parts). Refused at start on four
+  Sparks or more and with the tp4 branch's own-front, microbatch or ring settings, which it has not been ported to
+  (two Sparks tested, three untested). Builds on `0110` and
   `0111`. CPU checks: `tools/kv_shard_check.py`, `tools/kv_shard_mutants.sh`.
 
 - **A rewound conversation keeps its id** (patch `0111-glm-chat-continued`, by [wojo](https://github.com/wojo)): patch

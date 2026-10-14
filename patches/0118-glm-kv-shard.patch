@@ -106,7 +106,7 @@ index 30b9cbe..e287c42 100644
              v = dst.reshape(-1).view(torch.uint8)
              if p.spanned:
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 1f131ca..288ea42 100644
+index 1f131ca..32b6862 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -599,6 +599,14 @@ class GlmEngine:
@@ -118,7 +118,7 @@ index 1f131ca..288ea42 100644
 +        if shard.ON and parallel > 1:       # settings the shard cannot serve, refused now rather than at a request
 +            from .multi import verify_kind
 +
-+            why = shard.unsupported(verify_kind())
++            why = shard.unsupported(verify_kind(), world)
 +            if why:
 +                raise ValueError(why)
          # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
@@ -1940,10 +1940,10 @@ index b8361aa..afea97e 100644
              t[o + s] = r
 diff --git tensorfold/families/glm5_next/cuda/shard.py tensorfold/families/glm5_next/cuda/shard.py
 new file mode 100644
-index 0000000..0fff09d
+index 0000000..02b0394
 --- /dev/null
 +++ tensorfold/families/glm5_next/cuda/shard.py
-@@ -0,0 +1,544 @@
+@@ -0,0 +1,560 @@
 +"""TF_GLM_KV_SHARD=1 (two ranks or more, --parallel above 1): the latent cache stored once instead of on every rank.
 +
 +The pool's rows are split in parts, one a rank (two halves at two ranks): an extent lives in one part
@@ -1979,8 +1979,10 @@ index 0000000..0fff09d
 +
 +With the display reservation (TF_GLM_DISPLAY_KV_MIB) the first latent planes, each a half and its trash rows long, are
 +carved from its span as unsharded (the pool's rows count its bytes at a sharded token's cost). Not with
-+TF_GLM_MULTI_LONE, TF_GLM_MULTI_VERIFY=serial, or one rank (all refused at start). Past two ranks (TP3, TP4) the decode all-to-all and the prompt broadcast are untested
-+on hardware here (two Sparks): the CPU checks cover the pool's parts, placement and twins."""
++TF_GLM_MULTI_LONE, TF_GLM_MULTI_VERIFY=serial, one rank, four ranks or more, or the tp4 branch's TF_GLM_PROMPT_OWN_FRONT,
++TF_GLM_PROMPT_MICROBATCH or TF_NCCL_RING (all refused at start: ``unsupported``). At three ranks the decode all-to-all
++and the prompt broadcast are untested on hardware here (two Sparks): the CPU checks cover the pool's parts, placement
++and twins."""
 +
 +from __future__ import annotations
 +
@@ -2089,9 +2091,23 @@ index 0000000..0fff09d
 +                  f"{effective} tokens ({max_rows} rows of a part are a decode window's)")
 +
 +
-+def unsupported(verify: str) -> str | None:
-+    """Why the shard cannot run with TF_GLM_MULTI_VERIFY=``verify`` (None: it can)."""
++# Settings of upstream's tp4 branch (four Sparks) the shard has not been ported to: its own-row DSA prompt front and
++# prompt microbatching run their own DSA block on every rank's whole latent cache (not the owner's rows fetched here),
++# and its switchless ring (TF_NCCL_RING=1) has no link between opposite ranks for the carry's sends.
++TP4_SETTINGS = ("TF_GLM_PROMPT_OWN_FRONT", "TF_GLM_PROMPT_MICROBATCH", "TF_NCCL_RING")
 +
++
++def unsupported(verify: str, world: int = 2) -> str | None:
++    """Why the shard cannot run with TF_GLM_MULTI_VERIFY=``verify`` on ``world`` ranks (None: it can)."""
++
++    if world > 3:
++        return (f"TF_GLM_KV_SHARD=1 is not supported at TP={world}: it is tested at two ranks (three is untested), and "
++                "upstream's tp4 branch has prompt paths and a ring exchange it has not been ported to; leave "
++                "TF_GLM_KV_SHARD unset on four Sparks")
++    on = [k for k in TP4_SETTINGS if os.environ.get(k, "0").strip() == "1"]
++    if on:
++        return (f"TF_GLM_KV_SHARD=1 does not run with {', '.join(k + '=1' for k in on)} (the tp4 branch's prompt "
++                "front, microbatching or switchless ring, which the shard has not been ported to)")
 +    if verify == "serial":
 +        return ("TF_GLM_KV_SHARD=1 does not run with TF_GLM_MULTI_VERIFY=serial: the one-stream graphs it replays are "
 +                "captured with the rank that does not own the rows attending nothing (the owner computes every head), "

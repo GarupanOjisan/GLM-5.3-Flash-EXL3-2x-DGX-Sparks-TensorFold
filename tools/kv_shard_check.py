@@ -2289,6 +2289,35 @@ def no_import_per_piece():
     check("10 shard: the send and the receive of a piece import nothing (the dtype table is read once, at import)",
           all("import" not in inspect.getsource(f) for f in (shard._send, shard._recv)))
 section("10 no import per piece", no_import_per_piece)
+
+
+def tp4_guard():
+    """(11) Four ranks or more, and the tp4 branch's settings, are refused at start (``shard.unsupported``)."""
+
+    saved = {k: os.environ.pop(k, None) for k in shard.TP4_SETTINGS}
+    try:
+        check("11 guard: two and three ranks run (batched verify, no tp4 settings)",
+              shard.unsupported("batched", 2) is None and shard.unsupported("batched", 3) is None)
+        why = shard.unsupported("batched", 4)
+        check("11 guard: four ranks are refused, naming TP=4", why is not None and "TP=4" in why)
+        check("11 guard: eight ranks are refused too", shard.unsupported("batched", 8) is not None)
+        check("11 guard: serial verify still refused at two ranks", shard.unsupported("serial", 2) is not None)
+        for k in shard.TP4_SETTINGS:
+            os.environ[k] = "1"
+            why = shard.unsupported("batched", 2)
+            check(f"11 guard: {k}=1 is refused at two ranks, by name", why is not None and k in why)
+            os.environ[k] = "0"
+            check(f"11 guard: {k}=0 is not", shard.unsupported("batched", 2) is None)
+            os.environ.pop(k)
+        check("11 guard: the engine passes its rank count",
+              "shard.unsupported(verify_kind(), world)" in inspect.getsource(_engine))
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+section("11 tp4 guard", tp4_guard)
 print("FAILED" if fails else "ALL PASS", len(fails))
 sys.stdout.flush()
 os._exit(1 if fails else 0)
