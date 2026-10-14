@@ -192,6 +192,12 @@ export TF_GLM_WIDE_GRAPHS="$_w" TF_GLM_COPY_REPLY_MATCH="$_w"
 # kept prompts there, so interactive sessions miss the prompt cache and re-read whole histories (issues #12, #13).
 # Off by default until that move keeps them. Exact either way.
 export TF_GLM_MULTI_LONE="${TF_GLM_MULTI_LONE:-0}"
+# KV sharding (patch 0118, #152): each conversation's latent cache stored once, on the Spark that owns it, ~1.9x the
+# tokens in the same memory, replies byte-equal. ON BY DEFAULT IN THIS FORK (wojo) at two Sparks with more than one
+# stream, where it is tested (it needs --parallel above 1 and TF_GLM_MULTI_LONE=0; three Sparks are untested, four
+# refused). TF_GLM_KV_SHARD=0 turns it off; TF_GLM_KV_SHARD_CARRY=0 keeps it without the carry. README: KV sharding.
+_kvs=0; (( TP == 2 && PARALLEL > 1 )) && [[ "$TF_GLM_MULTI_LONE" == 0 ]] && _kvs=1
+export TF_GLM_KV_SHARD="${TF_GLM_KV_SHARD:-$_kvs}"
 # --parallel: rows of every request's verify window together in a round (patch 0069; TensorFold's TF_GLM_MULTI_WINDOW):
 # 16 to 64 in steps of 8; default 64 past 4 requests, else 32. With more requests at once each one's drafts get fewer of
 # these rows (8 at 32: ~3 drafts each): at 8 requests, code 141.2 (32 rows) / 160.3 (48) / 167.0 (64) tok/s, prose the
@@ -404,17 +410,35 @@ prepared_state() {
   echo "$line"
 }
 
-# Spill tier (patch 0088-glm-spill-tier, off by default): kept prompt states go to local disk on each Spark and come
-# back instead of a new prefill, also after a clean restart. SPILL_GIB: the cap per Spark (0: off). SPILL_DIR: the same
-# absolute path on every Spark (mounted at /spill; files owned by your user). SPILL_HIGHWATER: past this fraction of
-# the KV pool, the kept prompts eviction would take next are written in the background (1.0: only when evicted).
-# A clean stop writes what is kept within SPILL_FLUSH_S seconds; STOP_TIMEOUT gives it the time. README: Spill tier.
-SPILL_GIB="${SPILL_GIB:-0}"
+# Spill tier (patches 0088-glm-spill-tier and 0110-glm-spill-blocks, off by default): kept prompt states go to local
+# disk on each Spark when they are kept (PARALLEL above 1) and come back instead of a new prefill, also after a
+# restart or a crash. SPILL_GIB: the cap per Spark (0: off). SPILL_DIR: the same absolute path on every Spark (mounted
+# at /spill; files owned by your user). SPILL_QUOTA: the share of SPILL_GIB one conversation may hold before its own
+# old turns and forks go first (0: none). SPILL_TURNS: the newest states kept on a conversation's path; older turns
+# go as each one is written (each keeps a ~91 MB small part; 2 for heavy agent loops or a small disk, 8+ for chats with
+# deep edits, 0: every turn kept until room is needed).
+# SPILL_HIGHWATER: no longer used (states are written when kept). A clean stop writes what still waits within
+# SPILL_FLUSH_S seconds; STOP_TIMEOUT gives it the time. README: Spill tier.
+# ON BY DEFAULT IN THIS FORK (wojo): 64 GiB a Spark, a conversation up to a quarter of it (SPILL_QUOTA 0.25), as dogfooded
+# since 2026-10-09; it needs SPILL_MIN_FREE_GIB (50) free beside it on SPILL_DIR's disk, else writes are refused (no
+# error). SPILL_GIB=0 turns it off.
+SPILL_GIB="${SPILL_GIB:-64}"
 SPILL_DIR="${SPILL_DIR:-$HOME/.cache/tensorfold-spill}"
 SPILL_HIGHWATER="${SPILL_HIGHWATER:-0.70}"
 SPILL_MIN_TOKENS="${SPILL_MIN_TOKENS:-8192}"
 SPILL_MIN_FREE_GIB="${SPILL_MIN_FREE_GIB:-50}"
 SPILL_FLUSH_S="${SPILL_FLUSH_S:-60}"
+# (each also taken from its TF_GLM_ name when only that is set: exporting the TF_GLM_ name alone was overwritten)
+SPILL_QUOTA="${SPILL_QUOTA:-${TF_GLM_SPILL_QUOTA:-0.25}}"
+export TF_GLM_SPILL_QUOTA="$SPILL_QUOTA"
+SPILL_TURNS="${SPILL_TURNS:-${TF_GLM_SPILL_TURNS:-4}}"
+export TF_GLM_SPILL_TURNS="$SPILL_TURNS"
+# A request whose prompt starts with what another request is still prefilling (a system prompt several agents share)
+# waits for that state instead of prefilling it beside it (patch 0110): six agents at once on a fresh 12k-token system
+# prompt answered in 15 s instead of 47 s. Same replies. PREFIX_WAIT=0 turns it off. README: A system prompt
+# prefilled once.
+PREFIX_WAIT="${PREFIX_WAIT:-1}"
+export TF_GLM_PREFIX_WAIT="$PREFIX_WAIT"
 if [[ "$SPILL_GIB" != 0 ]]; then
   STOP_TIMEOUT="${STOP_TIMEOUT:-$(( ${SPILL_FLUSH_S%.*} + 30 ))}"
 fi
