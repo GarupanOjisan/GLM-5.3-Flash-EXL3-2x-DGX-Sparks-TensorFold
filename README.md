@@ -31,7 +31,8 @@
 > `TF_GLM_KV_SHARD=0` turns sharding off). Everything else, including 4 streams, is upstream's default. As each pull
 > request is merged upstream, this fork drops its copy.
 >
-> Thanks to Mia's AI Lab for the recipe, to @BadAd84 for the spill tier's block design and read-ahead, and to
+> Thanks to Mia's AI Lab for the recipe, to [Ash Hart](https://github.com/ashhart) for [TensorFold](https://github.com/ashhart/TensorFold), the engine
+> underneath it, to @BadAd84 for the spill tier's block design and read-ahead, and to
 > @SvangenStudios for testing sharding on a second pair of Sparks.
 
 Serve **GLM-5.3-Flash** from two NVIDIA DGX Sparks (GB10, 128 GB each, linked by their ConnectX-7 ports) through an
