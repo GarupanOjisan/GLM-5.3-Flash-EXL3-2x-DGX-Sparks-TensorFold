@@ -206,6 +206,16 @@ timestamps, gzipped, and prints where: `~/.cache/tensorfold-glm53/logs/<date>-<t
 (`LOG_DIR`) and `~/.cache/tensorfold-glm53/logs/<date>-<time>-rank1.log.gz` on the worker. The newest 10 of each
 rank are kept (`LOG_KEEP`; `0` saves none). Read one with `zcat` or `zless`; attach both when you report a crash.
 
+**A wedge in the prompt path (upstream issue #163, open, no fix yet).** On the 107-patch build (`e66c657a433d`) at
+`TP=2`, both ranks have been seen stuck while filling a long prompt: both GPUs at ~96%, `/health` answering but
+`rounds_total`, `prefill_seconds_total` and `pool_free_tokens` frozen, no log line, cancelling the request does not
+free its slot, and only a restart recovers. The stacks put rank 0 in `hcsplit._fill` and rank 1 in
+`dflash2_multi.add_taps`. To get those stacks into the log and turn the hang into a restart, start with
+`TF_GLM_MULTI_WATCHDOG_S=60 TF_GLM_MULTI_WATCHDOG_EXIT=1` (see [Configuration](#configuration)): a rank stuck 60 s
+in one step prints every thread's stack, then exits; restart the pair from a supervisor or a cron check on `/health`
+(`requests_running` above 0 with those counters frozen). `stop.sh` saves both ranks' logs; attach them to #163.
+`SPLIT=0` takes `hcsplit` out of the path, but nobody has confirmed in #163 that it avoids the wedge.
+
 If `start.sh` stops at a check:
 
 | Message | What to do |
