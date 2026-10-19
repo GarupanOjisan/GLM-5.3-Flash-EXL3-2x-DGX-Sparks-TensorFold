@@ -135,13 +135,20 @@ part of this recipe. See the [qualification note](docs/MCDMA_MAC_STUDIO_QUALIFIC
 
 - **Two DGX Sparks** (or two GB10 systems with 128 GB unified memory), with nothing else large on their GPUs: each
   needs ~110 GiB free memory when the server starts (`start.sh` warns below that; stop other GPU work).
-- **A direct ConnectX-7 link:** a QSFP cable between the CX7 ports and an IPv4 address on each end in one private
-  subnet (e.g. `192.0.2.1/24` and `192.0.2.2/24`; `ping` must work), with a RoCE v2 GID (`start.sh` checks). One QSFP
-  port of a Spark reaches the GB10 over two PCIe Gen5 x4 links, so it appears as two netdevs and two RoCE devices
-  (`enp1s0f0np0` / `enP2p1s0f0np0`, `rocep1s0f0` / `roceP2p1s0f0`). Address both twins on each Spark, in the link's
-  subnet or each in its own (NVIDIA's two-Spark playbook gives them different ones): both are then used, as is a second
-  cabled port in the link's subnet. A prompt chunk's all-gather is ~1.8x faster on two rails; one rail is one x4
-  (~112 Gb/s of the port's 200).
+- **A direct ConnectX-7 link:** a QSFP cable between the CX7 ports and a static IPv4 address on each end in one
+  private subnet (e.g. `192.0.2.1/24` and `192.0.2.2/24`; `ping` must work), with a RoCE v2 GID (`start.sh` checks). One
+  QSFP port of a Spark reaches the GB10 over two PCIe Gen5 x4 links, so it appears as two netdevs and two RoCE devices
+  (`enp1s0f0np0` / `enP2p1s0f0np0`, `rocep1s0f0` / `roceP2p1s0f0`). Address both twins on each Spark, each in its own
+  subnet, as NVIDIA's two-Spark playbook does (e.g. `enp1s0f0np0` in `192.0.2.0/24`, `enP2p1s0f0np0` in
+  `198.51.100.0/24`): both are then used, as is a second cabled port in the link's subnet. A prompt chunk's all-gather
+  is ~1.8x faster on two rails; one rail is one x4 (~112 Gb/s of the port's 200).
+- **Static fabric addresses, no gateway** (`ipv4.method manual`, `never-default`; no DHCP, no NetworkManager `shared`
+  mode on the link). Issue #196: with DHCP and both twins in one /24, routes crossed functions and each lease renewal
+  moved the RoCE v2 GID to another index under the running engine; both ranks then stopped in `_share` about every
+  61 minutes, counters frozen, no error logged, until a restart. Static addresses with one subnet per function ran
+  12.5 h and 1,300+ requests without it. `start.sh` finds the GID index once, at start, so it cannot see a later move;
+  re-activating a fabric connection (`nmcli con up`) while serving can move it too. Check with `ip -o -4 addr` (no
+  `dynamic`) and `ip route get <peer>` (it leaves by the twin in the peer's subnet).
 - **Key-based ssh** from the first Spark (the head, which runs `./start.sh` and the API) to the second (the worker):
   `ssh-copy-id user@<worker>` (after `ssh-keygen -t ed25519` if you have no key); check with
   `ssh -o BatchMode=yes user@<worker> true`.
@@ -213,6 +220,11 @@ If `start.sh` stops at a check:
 | `only N GiB memory available` | other GPU work runs on that Spark: stop it (`docker ps`) and restart |
 | `no RoCE device or RoCE v2 GID for the link` / `no route from this node to ...` | the route to the worker does not go over the CX7 port: set `FABRIC_PEER` to the worker's CX7 address and check both ends are addressed (`ip -4 addr`) |
 | `the worker's .../hub is not writable` | a container left it root-owned: fix its ownership on the worker |
+
+While serving, if both ranks stop at the same step about every hour (`/health` answers but its counters do not move,
+requests get 429 "all serving lanes are busy", no error in either log, only a restart recovers) and their stacks are in
+`_share`, check the fabric addressing first: DHCP or both twins in one subnet moves the RoCE v2 GID under the running
+engine (issue #196). Re-address it static, one subnet per function, no gateway (see [Requirements](#requirements)).
 
 ## Images and video
 
