@@ -359,22 +359,32 @@ FP8 KV, with the setting: 80 minutes of 4 concurrent agent-shaped streams (294 r
 pool driven to ~230k free tokens) left rank 0's `MemAvailable` flat (5.6 to 5.2 GiB, +0.17 GiB/h over the last 40 min)
 and rank 1's at 7.0 GiB, with no OOM killer event on either Spark. Same replies; nothing else changes.
 
-Picture-heavy sessions are a separate host path. Patch 0079's picture LRU counts a source's bytes and not the decoded
-canvas it keeps, so with the cache on (the default) rank 0's RSS can climb while the GPU allocation and rank 1 stay
-flat (upstream #154: about 450-550 MiB/h, `MemAvailable` into the low single-digit GiB). Two opt-in mitigations, both
-off unless you set them:
+Picture-heavy sessions can raise rank 0's host RSS. Upstream #154 (kutovoy; 2× DGX Spark, recipe `3fd60dfc`,
+image `v0.6.0-e66c657a433d`, kernel `7.0.0-1019-nvidia`, driver `580.178.04`, `expandable_segments:True`; RSS every
+5 minutes, rank 1 as the control) found the growth when patch 0079's picture cache is on and glibc's malloc arenas
+are uncapped. The cache keeps decoded canvases, and its byte cap counts source bytes only. The primary mitigation
+is `MALLOC_ARENA_MAX=2`, with the picture cache left on. `start.sh` passes that to both ranks when the variable is
+unset. `TENSORFOLD_GLM_PICTURE_CACHE=0` is the fallback if rank 0's RSS still climbs.
+
+| Episode | Config | Length | Rank 0 RSS | Rank 0 MemAvailable |
+| --- | --- | --- | --- | --- |
+| 1 | cache on, arenas stock (kernel 6.17, driver 580.173.02) | 21 h | 12.84 → 15.9 GiB (~325 MiB/h, accelerating to ~650) | fell to 1.55 GiB, then a reboot |
+| 2 | cache on, arenas stock | 3.5 h | 13.23 → 14.57 GiB (~560 MiB/h) | 4.4 → 3.1 GiB |
+| 3 | cache off, arenas stock | 36 h | 9.86 → 13.27 GiB; late residual ~65–230 MiB/h | 3.7–10.3 GiB |
+| 4 | cache on + `MALLOC_ARENA_MAX=2` | 44.3 h | 7.71 → 8.24 GiB; 5 MiB/h after warm-up (43 h); last 12 h 3 MiB/h | 8.5–12.5 GiB |
+
+The comment's workload line: episode 2 about 310M prompt tokens in 21 h, episode 3 about 286M in 36 h, episode 4
+663M in 44.3 h (the heaviest, and the flattest). Episode 4's rank 1 RSS was 7.58 → 7.40 GiB. The start baseline
+was about 1.7–2.5 GiB lower (anakronox, same thread: −1.8 GiB). Turning the cache off costs about 30 ms of
+time-to-first-token a picture. The arena cap does not, and it does not touch the CUDA allocator, pinned buffers
+or RoCE regions; decode and prefill speeds were unchanged (#143 measured the same).
 
 ```bash
-TENSORFOLD_GLM_PICTURE_CACHE=0 MALLOC_ARENA_MAX=2 ./start.sh restart
+TENSORFOLD_GLM_PICTURE_CACHE=0 ./start.sh restart   # fallback: cache off, arenas still capped at 2
+MALLOC_ARENA_MAX= ./start.sh restart                # glibc's own arena count; cache stays on
 ```
 
-`TENSORFOLD_GLM_PICTURE_CACHE=0` is the one that stopped the canvas climb (about +8 MiB/h over 19.6 h, noise). Later
-turns of a chat that still carries the same pictures decode them again (10 pictures: first token 0.16-0.19 s with the
-cache, 0.43-0.46 s without). `MALLOC_ARENA_MAX=2` is forwarded to every rank only when set (it is not a `TENSORFOLD_*`
-name). It caps glibc malloc arenas after concurrent image requests raise rank 0's thread count; one report stayed
-flat for seven days with no decode loss. It does not by itself explain the canvas climb. Record rank 0 and rank 1 RSS
-and `MemAvailable` every five minutes on a picture-heavy run and compare the slope with and without each setting.
-Nothing here was measured on this fork's two Sparks.
+A value you set must be a positive integer. This fork has not repeated the 44-hour run.
 
 TensorFold's budget on each Spark is `MemAvailable` at start minus a host reserve (`MEMORY_RESERVE_GIB`, 14.5 GiB here;
 TensorFold's own default is a tenth of RAM). The server uses about 10 GiB beyond its own estimate at its peak, so the
@@ -842,7 +852,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `KV` | `fp8` | `fp8` or `bf16` (exact, shorter window) DSA latent cache and indexer keys |
 | `WORKER_WEIGHTS` | `copy` | `copy`: the worker keeps its own copy of the weights; `nfs`: it reads the head's over NFS ([Worker weights over NFS](#worker-weights-over-nfs)); with `NFS_PATH`, `NFS_SERVER`, `NFS_VOLUME` |
 | `CUDA_ALLOC_CONF` | `expandable_segments:True` | `PYTORCH_CUDA_ALLOC_CONF` for every rank: lets the caching allocator grow and reclaim within one mapping instead of keeping fixed segments, which ratchet a rank's allocation up over days (#143); `""` unsets it |
-| `MALLOC_ARENA_MAX` | unset | glibc malloc arenas on every rank, forwarded only when set (it is not a `TENSORFOLD_*` / `TF_GLM_*` / `TF_ROCE_*` name). `2`: opt-in cap after concurrent image requests raise rank 0's thread count and arenas are not returned (upstream #154). Unset keeps glibc's default |
+| `MALLOC_ARENA_MAX` | `2` | glibc malloc arenas on every rank (not a `TENSORFOLD_*` / `TF_GLM_*` / `TF_ROCE_*` name, so `start.sh` passes it itself). Unset is `2`, the primary cap on rank 0's host RSS while the picture cache stays on (upstream #154, episode 4). `""` passes nothing and leaves glibc's own arena count. The picture cache stays at its own default |
 | `KV_POOL_GIB` / `MEMORY_RESERVE_GIB` | `12.5` (`32` at `TP=3`) / `14.5`, plus ~0.95 a request past 4 and ~0.04 a window row past 32 (`19.6` at 8 requests and 64 rows) | the shared pool beyond the window (kept prompts, more long conversations at once) grows into what is free at start minus the reserve, up to `KV_POOL_GIB` GiB a Spark; the reserve sets the lowest free memory on the head (~4.5-5 GiB under a 1M-token prompt); it grows with `PARALLEL` because more requests at once take more than the startup estimate counts; raise it when other work shares the Sparks |
 | `DISPLAY_KV_MIB` | `0` (off) | MiB of the GPU's display reservation added to the shared pool on every rank (patch 0072, `PARALLEL` above 1; a multiple of 16 up to 2032, 1792 measured): pool tokens without host memory, on top of `KV_POOL_GIB`; needs `/dev/dri/card0`; headless Sparks only (refused while a display is connected) |
 | `DISPLAY_KV_BACKEND` | `drm` | where `DISPLAY_KV_MIB`'s reservation comes from: `drm` (a DRM dumb buffer on `card0`, `nvidia_drm` with `modeset=1`) or `dispram` (kindling spark-os's `dispramd`; `start.sh` mounts its socket and client into every rank) (patch 0087) |
@@ -897,7 +907,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `TENSORFOLD_GLM_IMAGE_TOKENS` / `_VIDEO_TOKENS` / `_VIDEO_FRAMES` | `2048` / `16384` / `128` | a picture's and a clip's token caps, and a clip's frames |
 | `TENSORFOLD_GLM_MAX_IMAGES` / `_MAX_VIDEOS` | `50` / `4` | pictures and clips a request |
 | `TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS` / `_REQUEST_VIDEO_TOKENS` | `16384` / `32768` | tokens a request's pictures and clips share (each still within its own cap) |
-| `TENSORFOLD_GLM_PICTURE_CACHE` / `_PICTURE_CACHE_MB` / `_PICTURE_CANVASES` | `1` / `384` / `8` | the vision frontend reads a request's pictures once, not on every turn of the chat (patch `0079`): what reading each source cost is kept by the source's bytes (host memory only, LRU under `_MB`, that many fitted canvases); `0`: the path before the patch, bit for bit (by ThomasWadeZ, #63). The byte cap does not count decoded canvases, so under heavy image use rank 0's host RSS can climb; `0` is that mitigation (upstream #154, [KV pool and memory](#kv-pool-and-memory)) |
+| `TENSORFOLD_GLM_PICTURE_CACHE` / `_PICTURE_CACHE_MB` / `_PICTURE_CANVASES` | `1` / `384` / `8` | the vision frontend reads a request's pictures once, not on every turn of the chat (patch `0079`): what reading each source cost is kept by the source's bytes (host memory only, LRU under `_MB`, that many fitted canvases); `0`: the path before the patch, bit for bit (by ThomasWadeZ, #63). The byte cap does not count decoded canvases. Rank 0's host RSS is capped by the default `MALLOC_ARENA_MAX=2`; `0` is the fallback if it still climbs (upstream #154, [KV pool and memory](#kv-pool-and-memory)) |
 | `PREPARE` / `PULL` | `auto` / `1` | `start.sh` runs `scripts/prepare.sh` when needed (`1` always, `0` never); `prepare.sh` tries the prebuilt image first (`0`: always build locally) |
 | `WAIT_TIMEOUT` / `STOP_TIMEOUT` | `1800` / `30` | seconds `start.sh` waits for the server, and `stop.sh` gives it to shut down |
 | `LOG_DIR` / `LOG_KEEP` | `~/.cache/tensorfold-glm53/logs` / `10` | where `stop.sh` saves rank 0's log before it removes the container (rank 1's, and ranks 2 and 3's at `TP` above 2, to the same folder on their worker), and how many of each rank's to keep ([Logs of earlier runs](#quick-start)); `0`: none |
@@ -1030,7 +1040,7 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | Queued cancellation | `0073-glm-queued-cancellation` | a request waiting while every slot is busy, whose client left, is dropped at once instead of when a slot frees (the scheduler polls the waiting callers; only it removes them, so rank 1 never sees them); a reply whose client connection fails mid-stream ends after the round (delivery failures, after johnwhited's #48) (by desy0305, PR #51) | a ninth request cancelled with 8 slots busy: acknowledged in ~0.1-0.2 s; the busy replies unchanged (two Sparks, by desy0305) |
 | End of turn | `0075-glm-assistant-ends` | `<\|assistant\|>` ends a reply like the checkpoint's end tokens: the model sometimes started a second answer with it at high reasoning effort, and the raw token reached the reply's text (issue #60); `TF_GLM_ASSISTANT_ENDS=0` keeps the checkpoint's end tokens; the ranks check they agree at start | replies without the token unchanged |
 | Loop guard | `0091-glm-loop-guard` | `TF_GLM_LOOP_GUARD=1` (off by default): a think block that collapsed into repeating itself (an exact cycle of up to 16 tokens held for 256 tokens, or one token taking half of the last 256) is closed with the thinking budget's close and the model answers from there (issues #89, #94); `usage.tensorfold.loop_guard` counts it | off: nothing changes; on: a looping reply ends instead of running to `max_tokens` |
-| Picture cache | `0079-glm-picture-cache` | the vision frontend reads a request's pictures once, not on every turn of the chat: what reading each source cost (rows, key, digest, canvas) is kept by the source's bytes and handed back on later turns (host memory only; `TENSORFOLD_GLM_PICTURE_CACHE`, by ThomasWadeZ, #63). The cap counts source bytes, not canvases; `TENSORFOLD_GLM_PICTURE_CACHE=0` if rank 0's RSS climbs under image load (upstream #154) | 10 pictures in a chat, a later turn's first token 0.43-0.46 s -> 0.16-0.19 s; prompt tokens and replies identical |
+| Picture cache | `0079-glm-picture-cache` | the vision frontend reads a request's pictures once, not on every turn of the chat: what reading each source cost (rows, key, digest, canvas) is kept by the source's bytes and handed back on later turns (host memory only; `TENSORFOLD_GLM_PICTURE_CACHE`, by ThomasWadeZ, #63). The cap counts source bytes, not canvases. Rank 0 RSS under image load is capped by the default `MALLOC_ARENA_MAX=2`; `TENSORFOLD_GLM_PICTURE_CACHE=0` is the fallback if it still climbs (upstream #154) | 10 pictures in a chat, a later turn's first token 0.43-0.46 s -> 0.16-0.19 s; prompt tokens and replies identical |
 | MPO JPEG | `0120-vision-mpo-jpeg` | an iPhone camera JPEG (MPO, two frames, or three for Ultra HDR) is accepted as its first frame; the animated/multipage guard no longer refuses it (upstream #201). Animated WebP and every other multipage format stay refused | `tools/mpo_jpeg_check.py` on CPU; a phone photo through the API still needs the two Sparks |
 | Quoted markers | `0080-vision-quoted-markers` | every picture and clip of a request is marked with a per-request nonce, and a marker not behind one stays text: quoting the template's picture span in a prompt, a log or a refusal no longer counts as media, while a template or client that drops a picture is still refused (by ThomasWadeZ, #64) | a request quoting the picture span beside a real picture: 400 -> 200, the right answer |
 | Literal control tokens | `0121-glm-literal-added-tokens` | a spelling of an added token in chat-request text (a user or system message, a tool result, a tool definition, restored reasoning) is masked before the template renders and encoded as ordinary text; the template's own control tokens stay tokens. On by default (`TF_GLM_LITERAL_TOKENS=0` turns it off). `/completions` is unchanged (ashhart/TensorFold #1117) | `tools/literal_tokens_check.py` on CPU against the checkpoint tokenizer; a greedy reply on the two Sparks is still unchecked |
