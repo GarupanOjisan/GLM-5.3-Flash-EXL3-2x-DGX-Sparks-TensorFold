@@ -39,8 +39,9 @@
 #   decode   TF_GLM_L2PF (1), TF_GLM_EXL3_LOADS (nc), TF_ROCE_MAX_KB (512), TF_GLM_MULTI_LONE (0),
 #            TF_GLM_MULTI_WINDOW (32)
 #   ranks    every TENSORFOLD_*, TF_GLM_* and TF_ROCE_* variable goes to every rank (TP>2: TF_ROCE_HCA per node, found),
-#            e.g.
-#            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
+#            plus MALLOC_ARENA_MAX when it is set (glibc arenas; it has none of those prefixes). e.g.
+#            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0,
+#            TENSORFOLD_GLM_PICTURE_CACHE=0, MALLOC_ARENA_MAX=2   # host RSS on rank 0 under heavy image use
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
@@ -101,6 +102,9 @@ DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 [[ "$TF_GLM_L2PF" =~ ^(0|off|1|bulk|lines|touch)$ ]] || die "TF_GLM_L2PF is 0, 1 (bulk), lines or touch, not $TF_GLM_L2PF"
 [[ "$TF_GLM_EXL3_LOADS" =~ ^(0|ldg|1|nc|nc1|nc2|nc4)$ ]] || die "TF_GLM_EXL3_LOADS is 0, nc, nc2 or nc4, not $TF_GLM_EXL3_LOADS"
 [[ "$TF_GLM_EXL3_DEC_ORDER" =~ ^[012]$ ]] || die "TF_GLM_EXL3_DEC_ORDER is 0, 1 or 2, not $TF_GLM_EXL3_DEC_ORDER"
+if [[ -n "${MALLOC_ARENA_MAX:-}" ]]; then
+  [[ "$MALLOC_ARENA_MAX" =~ ^[1-9][0-9]*$ ]] || die "MALLOC_ARENA_MAX is a positive integer (2: fewer glibc malloc arenas), not $MALLOC_ARENA_MAX"
+fi
 [[ "$TF_ROCE_MAX_KB" =~ ^[1-9][0-9]*$ ]] || die "TF_ROCE_MAX_KB is a size in KiB (512: up to 32-row windows over RoCE), not $TF_ROCE_MAX_KB"
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
 [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
@@ -313,6 +317,8 @@ env_args() {
   local _skip='^$' name
   ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
   [[ -n "${CUDA_ALLOC_CONF:-}" ]] && ENV_ARGS+=(-e PYTORCH_CUDA_ALLOC_CONF="$CUDA_ALLOC_CONF")
+  # not a TENSORFOLD_*/TF_GLM_*/TF_ROCE_* name, so the loop below does not see it (upstream #154)
+  [[ -n "${MALLOC_ARENA_MAX:-}" ]] && ENV_ARGS+=(-e MALLOC_ARENA_MAX="$MALLOC_ARENA_MAX")
   (( TP == 2 )) || _skip='^TF_ROCE_HCA='
   while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" || true)
 }
