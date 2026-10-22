@@ -855,6 +855,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `TF_ROCE_WAIT_S` | `300` | seconds a RoCE all-gather waits for the other Spark before it fails (1 to 3600; the patch's own default is 20, which a late peer on long prompts outlasted, issue #54); until the engine is built, each gather first meets the peer in an NCCL barrier, so a long first start (kernels compiling) does not run into it |
 | `TF_GLM_MULTI_WINDOW` | `32`, `64` past 4 requests | with `PARALLEL` above 1, the rows of every request's verify window together in a round (16 to 64 in steps of 8): with more requests at once each one's drafts get fewer of them (8 requests' code: 141.2 / 160.3 / 167.0 tok/s at 32 / 48 / 64 rows); past 32 rows `TF_ROCE_MAX_KB` rises with it (64: 1024) unless you set it. Exact at any size |
 | `TF_GLM_MULTI_LONE` | `0` | `1`: with `PARALLEL` above 1, a request decoding alone runs on the one-stream graphs (+0.6-0.9%), but its move to the pool's first rows evicts other conversations' kept prompts there (issues #12, #13); `0`: on the batched ones |
+| `TF_GLM_MULTI_DEPTH` | unset (`policy`) | opt-in `joint`: a round's verify rows chosen by expected tokens per measured batch cost, instead of each request's own cutoff (patch 0035). `TF_GLM_MULTI_OVERHEAD_MS` pins that cost estimate (engine default 12; not a sleep). One 2× GB10 report saw +11% to +50% output tok/s on 2K-32K prompts (upstream #198); a later 2× GB10 run on short prompts saw −3.5% to +3.3%. The gain is unconfirmed. Keep the same settings, prompt lengths and KV budget, and alternate which arm starts first. `policy` stays the default |
 | `TF_GLM_QMM_CLUSTERS` | unset | `1`: decode windows' 4-bit matmuls reduce every 2-8 K-slice split in a thread-block cluster, the rule before patch `0103`; unset: the buffer path at up to 64 rows under 28 Mi weight values (the same bits either way) |
 | `TF_GLM_CACHE_ENTRIES` | `32` | kept prompt states at most (TensorFold's default is 8); past this count a conversation's earlier (superseded) states go first, then the least recently used, however much of the pool is free (patch `0063`, @Alexbob0); shared-prefix states (a system block) go by recency only, so a new run of an agent still finds its system prompt (patch `0077`, issue #75, @meleesciony). An agent request keeps 1 to 3 (issue #17); each costs ~45 MiB at start, reserved out of the pool's `KV_POOL_GIB` budget (the pool shrinks by it, the estimate does not change), flat in the context length. Symptom of too few: `/health` `kept_prompts` stuck at the count while `pool_free_tokens` is large (issue #84, @jdecker76); see `TF_GLM_CACHE_SHARE_PCT` |
 | `TF_GLM_CACHE_SHARE_PCT` | `0` (off) | make the kept-state count at least this share of the `KV_POOL_GIB` budget (patch `0097`, issue #84 by @jdecker76): on two Sparks at the defaults each state reserves ~91 MiB of a ~7.5 GiB budget, so 32 states already take ~38%: `50` gives ~42 states, the ceiling ~63 (each costs pool tokens), so the pool's tokens, not 32 finished one-shot conversations, decide when a live conversation goes. Any count is cut to three quarters of the budget (logged at start): past that the reservation would exceed the estimate. Set the same on every Spark |
@@ -885,6 +886,19 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 
 Speed settings' measured effects: [What the patches change](#what-the-patches-change). Any `TENSORFOLD_*`,
 `TF_GLM_*` or `TF_ROCE_*` variable is passed to both ranks (export it in `scripts/local.sh`; `.env` lines are).
+
+`TF_GLM_MULTI_DEPTH=joint` is optional. Unset is `policy`, and that stays the default. Upstream #198 reported +11% to
++50% output throughput on 2× GB10 with 2K-32K prompts, concurrency 1 and 4, and 512 output tokens, changing only
+that variable and `TF_GLM_MULTI_OVERHEAD_MS=12` on both ranks. A second 2× GB10 measurement (short prompts of 14 and
+25 tokens, 256 output tokens, `PARALLEL=2`) saw −3.5% to +3.3% and did not treat the difference as a repeatable gain.
+The workloads are not the same, and the second run also saw different KV pools between the two starts. To compare
+here, keep every other setting, the prompt lengths and the KV budget the same, alternate which arm is started first,
+and repeat. Rank 0 should log `depth joint (overhead 12 ms)`. Check a greedy reply (`"temperature": 0`) still matches
+`policy` before relying on `joint`. This fork has not measured it.
+
+```bash
+TF_GLM_MULTI_DEPTH=joint TF_GLM_MULTI_OVERHEAD_MS=12 ./start.sh restart
+```
 
 **Revision pins.** The checkpoint and DFlash2 are pinned to the revisions this recipe was measured with
 (`MODEL_REVISION`, `DFLASH2_REVISION`): both ranks serve exactly those from the local cache, and a new upstream commit

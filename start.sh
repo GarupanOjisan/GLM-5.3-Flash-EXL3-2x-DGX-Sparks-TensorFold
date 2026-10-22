@@ -38,7 +38,7 @@
 #            DRY_RUN=1 (print the docker commands, change nothing);
 #            STOP_TIMEOUT (stop.sh); LOG_DIR, LOG_KEEP (saved server logs)
 #   decode   TF_GLM_L2PF (1), TF_GLM_EXL3_LOADS (nc), TF_ROCE_MAX_KB (512), TF_GLM_MULTI_LONE (0),
-#            TF_GLM_MULTI_WINDOW (32)
+#            TF_GLM_MULTI_WINDOW (32), TF_GLM_MULTI_DEPTH (unset: policy; joint is opt-in)
 #   ranks    every TENSORFOLD_*, TF_GLM_* and TF_ROCE_* variable goes to every rank (TP>2: TF_ROCE_HCA per node, found),
 #            e.g.
 #            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
@@ -100,6 +100,21 @@ DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 # decode settings the ranks read at load (scripts/config.sh): checked here so a typo fails before anything is stopped
 [[ "$TF_GLM_MULTI_LONE" =~ ^[01]$ ]] || die "TF_GLM_MULTI_LONE is 0 or 1, not $TF_GLM_MULTI_LONE"
 [[ "$TF_GLM_MULTI_WINDOW" =~ ^(16|24|32|40|48|56|64)$ ]] || die "TF_GLM_MULTI_WINDOW is 16 to 64 rows in steps of 8, not $TF_GLM_MULTI_WINDOW"
+if [[ -n "${TF_GLM_MULTI_DEPTH:-}" ]]; then
+  case "$TF_GLM_MULTI_DEPTH" in
+    policy|joint) ;;
+    scale:*)
+      _a=${TF_GLM_MULTI_DEPTH#scale:}
+      awk -v a="$_a" 'BEGIN { if (a+0 != a || a <= 0 || a > 4) exit 1 }' ||
+        die "TF_GLM_MULTI_DEPTH=scale:A: A above 0 and at most 4, not $_a"
+      ;;
+    *) die "TF_GLM_MULTI_DEPTH is policy, joint or scale:A, not $TF_GLM_MULTI_DEPTH" ;;
+  esac
+fi
+if [[ -n "${TF_GLM_MULTI_OVERHEAD_MS:-}" ]]; then
+  awk -v a="$TF_GLM_MULTI_OVERHEAD_MS" 'BEGIN { if (a+0 != a || a < 0 || a > 1000) exit 1 }' ||
+    die "TF_GLM_MULTI_OVERHEAD_MS is 0 to 1000 (the engine's default is 12), not $TF_GLM_MULTI_OVERHEAD_MS"
+fi
 [[ "$TF_GLM_CLEAR_THINKING" =~ ^[01]$ ]] || die "TF_GLM_CLEAR_THINKING is 0 or 1, not $TF_GLM_CLEAR_THINKING"
 [[ "$TF_GLM_EFFORT_TAIL" =~ ^[01]$ ]] || die "TF_GLM_EFFORT_TAIL is 0 or 1, not $TF_GLM_EFFORT_TAIL"
 [[ "$TF_GLM_L2PF" =~ ^(0|off|1|bulk|lines|touch)$ ]] || die "TF_GLM_L2PF is 0, 1 (bulk), lines or touch, not $TF_GLM_L2PF"
