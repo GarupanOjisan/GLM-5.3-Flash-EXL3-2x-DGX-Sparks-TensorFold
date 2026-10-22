@@ -208,6 +208,17 @@ export TF_GLM_MULTI_WINDOW="${TF_GLM_MULTI_WINDOW:-$_win}"
 if (( TF_GLM_MULTI_WINDOW > 32 )) && [[ "$TF_ROCE_MAX_KB" == 512 ]]; then
   export TF_ROCE_MAX_KB=$(( TF_GLM_MULTI_WINDOW * 16 ))
 fi
+# How many drafts a round verifies across streams (patch 0035; TF_GLM_MULTI_DEPTH). Not set here, so the engine's
+# default stands: policy (each stream keeps its own DFlash2 cutoff). joint is opt-in: every drafting stream's chain
+# is walked to its policy's most, then the round's rows are split by expected tokens per millisecond, on the
+# startup-timed cost of the batched window plus TF_GLM_MULTI_OVERHEAD_MS (the engine's default 12; not a 12 ms sleep).
+# One 2× GB10 report (upstream #198; this pin, --parallel 4, 2K-32K inputs, 512 output tokens) saw +11% to +50%
+# output tok/s. A later 2× GB10 measurement (PARALLEL=2, 14/25-token prompts, 256 output tokens) saw -3.5% to +3.3%
+# and did not call that a repeatable gain. The two workloads differ, so the default stays policy.
+#   TF_GLM_MULTI_DEPTH=joint TF_GLM_MULTI_OVERHEAD_MS=12 ./start.sh restart
+# Rank 0 then logs "depth joint (overhead 12 ms)". Compare on the same settings, prompt lengths and KV budget,
+# alternating which arm starts first, and repeat; a greedy reply should still match policy. scale:A (a stream's
+# cutoff raised with the stream count) is the engine's third mode, not the profile above.
 # Kept prompt states (TensorFold's TF_GLM_CACHE_ENTRIES, 8 by default): the oldest is dropped past this count, however
 # much of the pool is free. A drafted agent request keeps 1 to 3 (its own plus shared-prefix states), so 8 let three
 # or four alternating conversations push each other out (issue #17). Each entry reserves its fixed state (~45 MiB) at
@@ -229,6 +240,11 @@ export TF_GLM_CACHE_SHARE_PCT="${TF_GLM_CACHE_SHARE_PCT:-0}"
 # /health shows kept_bytes, kept_bytes_cap and kept_mix.
 export TF_GLM_KEPT_BYTES_GIB="${TF_GLM_KEPT_BYTES_GIB:-0}"
 export TF_GLM_KEEP_PER_CHAT="${TF_GLM_KEEP_PER_CHAT:-0}"
+# TF_GLM_KEEP_REASONING (patch 0036; not set here, so TensorFold's default stands: 1024 kept replies,
+# TF_GLM_KEEP_REASONING_MB 32). 0 turns restoration off. Opt-in workaround when a long agent session stalls in
+# fill ("decode 0, fill 1") and rank 0 then SIGSEGVs (ashhart/TensorFold #993). The cause is not confirmed on
+# this pin. Export it; start.sh forwards every TF_GLM_* name. While capturing a stall set
+# TF_GLM_MULTI_WATCHDOG_S=30 and leave TF_GLM_MULTI_WATCHDOG_EXIT=0 (1 exits after the first dump). README.
 # Earlier turns keep their reasoning in the prompt (patch 0060), as in zai-org's current template. 1: drop it, as the
 # checkpoint's template does; agents then prefill the previous turn's tool loop again at each new user message.
 export TF_GLM_CLEAR_THINKING="${TF_GLM_CLEAR_THINKING:-0}"
@@ -239,6 +255,11 @@ export TF_GLM_CLEAR_THINKING="${TF_GLM_CLEAR_THINKING:-0}"
 # check the effort levels still answer differently (tools/toolcheck.py, tools/end_of_turn.py) before relying on it.
 # Not a request field: it changes every thinking-on prompt, and every rank reads it with the other TF_GLM_* switches.
 export TF_GLM_EFFORT_TAIL="${TF_GLM_EFFORT_TAIL:-0}"
+# Control-token spellings in a chat request stay text (patch 0121, on by default). Not set here: a missing
+# TF_GLM_LITERAL_TOKENS is 1 inside the server. 0 restores Python server v0.6.0, which encoded a spelling of an
+# added token (<think>, <|user|>, <tool_call>, a tool description, a tool result) as that token
+# (ashhart/TensorFold #1117). /completions is unchanged. Export 0 to turn it off; start.sh forwards every TF_GLM_* name.
+#   TF_GLM_LITERAL_TOKENS=0 ./start.sh restart
 # Admission at saturation (patch 0075): past the lanes plus MAX_QUEUED a foreground request is refused with
 # 429 + Retry-After (529 overloaded_error through the Anthropic bridge) instead of queueing invisibly. Unset
 # queues as every scheduler always has; 0 refuses anything past the lanes. A single-instance deployment with

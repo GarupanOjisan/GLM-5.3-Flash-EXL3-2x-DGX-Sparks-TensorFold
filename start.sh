@@ -29,6 +29,7 @@
 #            WORKER_WEIGHTS2, NFS_SERVER2,
 #            STATE_DIR, HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
 #            CUDA_ALLOC_CONF (PYTORCH_CUDA_ALLOC_CONF for every rank; default expandable_segments:True, "" unsets)
+#   tokens   TF_GLM_LITERAL_TOKENS (1, the default: a control-token spelling in request text stays text; 0 turns that off)
 #   image    IMAGE, TF_VERSION, TF_REPO, BASE_IMAGE, GHCR_IMAGE, IMAGE_TAG / IMAGE_DIGEST (the pinned published
 #            image), CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), PULL, MIN_FREE_GB, IMAGE_FREE_GB, RSYNC_OPTS, HF_TOKEN (prepare.sh's downloads;
@@ -37,11 +38,14 @@
 #            DRY_RUN=1 (print the docker commands, change nothing);
 #            STOP_TIMEOUT (stop.sh); LOG_DIR, LOG_KEEP (saved server logs)
 #   decode   TF_GLM_L2PF (1), TF_GLM_EXL3_LOADS (nc), TF_ROCE_MAX_KB (512), TF_GLM_MULTI_LONE (0),
-#            TF_GLM_MULTI_WINDOW (32)
+#            TF_GLM_MULTI_WINDOW (32), TF_GLM_MULTI_DEPTH (unset: policy; joint is opt-in)
 #   ranks    every TENSORFOLD_*, TF_GLM_* and TF_ROCE_* variable goes to every rank (TP>2: TF_ROCE_HCA per node, found),
 #            plus MALLOC_ARENA_MAX when it is set (glibc arenas; it has none of those prefixes). e.g.
 #            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0,
 #            TENSORFOLD_GLM_PICTURE_CACHE=0, MALLOC_ARENA_MAX=2   # host RSS on rank 0 under heavy image use
+#   agents   TF_GLM_KEEP_REASONING=0 leaves a dropped tool step's reasoning unrestored (fill-stall / SIGSEGV
+#            workaround, ashhart/TensorFold #993; default stays 1024). TF_GLM_MULTI_WATCHDOG_S=30 with
+#            TF_GLM_MULTI_WATCHDOG_EXIT=0 records stacks and keeps the process up
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
@@ -97,6 +101,21 @@ DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 # decode settings the ranks read at load (scripts/config.sh): checked here so a typo fails before anything is stopped
 [[ "$TF_GLM_MULTI_LONE" =~ ^[01]$ ]] || die "TF_GLM_MULTI_LONE is 0 or 1, not $TF_GLM_MULTI_LONE"
 [[ "$TF_GLM_MULTI_WINDOW" =~ ^(16|24|32|40|48|56|64)$ ]] || die "TF_GLM_MULTI_WINDOW is 16 to 64 rows in steps of 8, not $TF_GLM_MULTI_WINDOW"
+if [[ -n "${TF_GLM_MULTI_DEPTH:-}" ]]; then
+  case "$TF_GLM_MULTI_DEPTH" in
+    policy|joint) ;;
+    scale:*)
+      _a=${TF_GLM_MULTI_DEPTH#scale:}
+      awk -v a="$_a" 'BEGIN { if (a+0 != a || a <= 0 || a > 4) exit 1 }' ||
+        die "TF_GLM_MULTI_DEPTH=scale:A: A above 0 and at most 4, not $_a"
+      ;;
+    *) die "TF_GLM_MULTI_DEPTH is policy, joint or scale:A, not $TF_GLM_MULTI_DEPTH" ;;
+  esac
+fi
+if [[ -n "${TF_GLM_MULTI_OVERHEAD_MS:-}" ]]; then
+  awk -v a="$TF_GLM_MULTI_OVERHEAD_MS" 'BEGIN { if (a+0 != a || a < 0 || a > 1000) exit 1 }' ||
+    die "TF_GLM_MULTI_OVERHEAD_MS is 0 to 1000 (the engine's default is 12), not $TF_GLM_MULTI_OVERHEAD_MS"
+fi
 [[ "$TF_GLM_CLEAR_THINKING" =~ ^[01]$ ]] || die "TF_GLM_CLEAR_THINKING is 0 or 1, not $TF_GLM_CLEAR_THINKING"
 [[ "$TF_GLM_EFFORT_TAIL" =~ ^[01]$ ]] || die "TF_GLM_EFFORT_TAIL is 0 or 1, not $TF_GLM_EFFORT_TAIL"
 [[ "$TF_GLM_L2PF" =~ ^(0|off|1|bulk|lines|touch)$ ]] || die "TF_GLM_L2PF is 0, 1 (bulk), lines or touch, not $TF_GLM_L2PF"
@@ -106,6 +125,9 @@ if [[ -n "${MALLOC_ARENA_MAX:-}" ]]; then
   [[ "$MALLOC_ARENA_MAX" =~ ^[1-9][0-9]*$ ]] || die "MALLOC_ARENA_MAX is a positive integer (2: fewer glibc malloc arenas), not $MALLOC_ARENA_MAX"
 fi
 [[ "$TF_ROCE_MAX_KB" =~ ^[1-9][0-9]*$ ]] || die "TF_ROCE_MAX_KB is a size in KiB (512: up to 32-row windows over RoCE), not $TF_ROCE_MAX_KB"
+if [[ -n "${TF_GLM_LITERAL_TOKENS:-}" ]]; then
+  [[ "$TF_GLM_LITERAL_TOKENS" =~ ^[01]$ ]] || die "TF_GLM_LITERAL_TOKENS is 0 or 1 (1: request text stays text), not $TF_GLM_LITERAL_TOKENS"
+fi
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
 [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
 [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)

@@ -223,6 +223,23 @@ in one step prints every thread's stack, then exits; restart the pair from a sup
 (`requests_running` above 0 with those counters frozen). `stop.sh` saves both ranks' logs; attach them to #163.
 `SPLIT=0` takes `hcsplit` out of the path, but nobody has confirmed in #163 that it avoids the wedge.
 
+**Fill stalls and a rank 0 SIGSEGV on long agent sessions (ashhart/TensorFold #993, open, no fix yet).** On an older
+pin than this fork's, a 2× Spark TP=2 server intermittently sat in "decode 0, fill 1" for 14-20 s (`/health`
+`iteration_s`), then rank 0 died with SIGSEGV (exit 139) while rank 1 waited. The stacks were in `kept_reasoning`
+(`signature` / `_keys` / `restore`) and `multi._fill`. `TF_GLM_KEEP_REASONING=0` then ran for hours with `kept_prompts`
+at 32 and the pool nearly full. The cause is not identified, and it has not been reproduced on this fork's pin
+(`3fd60dfc` / `e66c657a433d`). The variable already exists (patch `0036`, default 1024 kept replies and 32 MiB) and
+`start.sh` forwards every exported `TF_GLM_*` name to both ranks. To compare, without changing the default:
+
+```bash
+TF_GLM_KEEP_REASONING=0 ./start.sh restart
+```
+
+The cost: when an agent drops a tool step's reasoning, the server no longer puts it back (see [Tool calling](#api-notes)
+below). To capture a stall without killing the process, set `TF_GLM_MULTI_WATCHDOG_S=30` and leave
+`TF_GLM_MULTI_WATCHDOG_EXIT=0` (the default). `EXIT=1` dumps stacks and then exits. Watch `/health`'s `iteration_s`
+next to `streams.*`. Unset `TF_GLM_KEEP_REASONING` (or set it back to `1024`) to restore the default.
+
 If `start.sh` stops at a check:
 
 | Message | What to do |
@@ -260,9 +277,11 @@ pictures are the same.
 
 | | Images | Videos |
 | --- | --- | --- |
-| Formats | JPEG, PNG, WebP | MP4, WebM, MOV, MKV (anything FFmpeg decodes) |
+| Formats | JPEG (including iPhone MPO), PNG, WebP | MP4, WebM, MOV, MKV (anything FFmpeg decodes) |
 | Per request | up to 50 (`TENSORFOLD_GLM_MAX_IMAGES`), 10 MB each, 64 MB in all | up to 4 (`TENSORFOLD_GLM_MAX_VIDEOS`), 64 MB each, 96 MB in all, up to an hour of footage each |
 | Tokens | at most 2,048 a picture (`TENSORFOLD_GLM_IMAGE_TOKENS`; a 1080p picture takes 2,040); a request's pictures share 16,384 (`TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS`), so past 8 each gets an equal share (327 with 50) | 2 frames a second, at most 128 frames spread over the whole clip (`TENSORFOLD_GLM_VIDEO_FRAMES`), at most 16,384 tokens a clip (`TENSORFOLD_GLM_VIDEO_TOKENS`); a request's clips share 32,768 (`TENSORFOLD_GLM_REQUEST_VIDEO_TOKENS`), so 3 or 4 clips get 10,922 or 8,192 each |
+
+An iPhone camera JPEG is an MPO. Pillow reports two frames (the picture, then a depth or gain map), and an Android Ultra HDR photo can add one more. Those used to come back HTTP 400 (`animated and multipage images are unsupported`). The picture is frame 0, which is what the model sees; the later frames are not sent on. Animated WebP, GIF and APNG stay refused (patch `0120`).
 
 A request body can be up to 96 MiB, so data URLs carry about 70 MB of pictures and clips in all.
 By default only data URLs are accepted; `VISION_URLS=1` also lets the server fetch public `https://` URLs.
@@ -843,6 +862,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `MAX_TOKENS` | `32768` | the reply budget (reasoning and answer) of a request that sets no `max_tokens`; TensorFold's own default is 4,096 |
 | `THINKING` | `1` (`0` with `ABLIT=1`) | think before answering by default; `0` answers directly unless a request asks to think |
 | `VISION` / `VISION_URLS` | `1` / `0` | image and video input; `1` also accepts public `https://` URLs |
+| `TF_GLM_LITERAL_TOKENS` | `1` | a spelling of a control token in chat-request text stays ordinary text (patch `0121`). Unset is the same as `1`. `0` restores Python server v0.6.0, which turned that spelling into the token (ashhart/TensorFold #1117). `/completions` is unchanged |
 | `COMM` | `roce` | the ranks' small all-gathers as one-shot RDMA writes over the RoCE link; `nccl`: NCCL for all |
 | `SPLIT` | `1` | prompt chunks' hyper-connection work split between the Sparks, its exchanges overlapped with the next rows' work; when a rank's first NCCL connection fails with it (NCCL error 2, issue #36), `start.sh` tries once more, then starts with `SPLIT=0` and says so |
 | `KDA_CHUNKED` | `1` | KDA prompt chunks in chunked (WY) form, one CUDA kernel |
@@ -853,6 +873,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `TF_ROCE_WAIT_S` | `300` | seconds a RoCE all-gather waits for the other Spark before it fails (1 to 3600; the patch's own default is 20, which a late peer on long prompts outlasted, issue #54); until the engine is built, each gather first meets the peer in an NCCL barrier, so a long first start (kernels compiling) does not run into it |
 | `TF_GLM_MULTI_WINDOW` | `32`, `64` past 4 requests | with `PARALLEL` above 1, the rows of every request's verify window together in a round (16 to 64 in steps of 8): with more requests at once each one's drafts get fewer of them (8 requests' code: 141.2 / 160.3 / 167.0 tok/s at 32 / 48 / 64 rows); past 32 rows `TF_ROCE_MAX_KB` rises with it (64: 1024) unless you set it. Exact at any size |
 | `TF_GLM_MULTI_LONE` | `0` | `1`: with `PARALLEL` above 1, a request decoding alone runs on the one-stream graphs (+0.6-0.9%), but its move to the pool's first rows evicts other conversations' kept prompts there (issues #12, #13); `0`: on the batched ones |
+| `TF_GLM_MULTI_DEPTH` | unset (`policy`) | opt-in `joint`: a round's verify rows chosen by expected tokens per measured batch cost, instead of each request's own cutoff (patch 0035). `TF_GLM_MULTI_OVERHEAD_MS` pins that cost estimate (engine default 12; not a sleep). One 2× GB10 report saw +11% to +50% output tok/s on 2K-32K prompts (upstream #198); a later 2× GB10 run on short prompts saw −3.5% to +3.3%. The gain is unconfirmed. Keep the same settings, prompt lengths and KV budget, and alternate which arm starts first. `policy` stays the default |
 | `TF_GLM_QMM_CLUSTERS` | unset | `1`: decode windows' 4-bit matmuls reduce every 2-8 K-slice split in a thread-block cluster, the rule before patch `0103`; unset: the buffer path at up to 64 rows under 28 Mi weight values (the same bits either way) |
 | `TF_GLM_CACHE_ENTRIES` | `32` | kept prompt states at most (TensorFold's default is 8); past this count a conversation's earlier (superseded) states go first, then the least recently used, however much of the pool is free (patch `0063`, @Alexbob0); shared-prefix states (a system block) go by recency only, so a new run of an agent still finds its system prompt (patch `0077`, issue #75, @meleesciony). An agent request keeps 1 to 3 (issue #17); each costs ~45 MiB at start, reserved out of the pool's `KV_POOL_GIB` budget (the pool shrinks by it, the estimate does not change), flat in the context length. Symptom of too few: `/health` `kept_prompts` stuck at the count while `pool_free_tokens` is large (issue #84, @jdecker76); see `TF_GLM_CACHE_SHARE_PCT` |
 | `TF_GLM_CACHE_SHARE_PCT` | `0` (off) | make the kept-state count at least this share of the `KV_POOL_GIB` budget (patch `0097`, issue #84 by @jdecker76): on two Sparks at the defaults each state reserves ~91 MiB of a ~7.5 GiB budget, so 32 states already take ~38%: `50` gives ~42 states, the ceiling ~63 (each costs pool tokens), so the pool's tokens, not 32 finished one-shot conversations, decide when a live conversation goes. Any count is cut to three quarters of the budget (logged at start): past that the reservation would exceed the estimate. Set the same on every Spark |
@@ -883,6 +904,19 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 
 Speed settings' measured effects: [What the patches change](#what-the-patches-change). Any `TENSORFOLD_*`,
 `TF_GLM_*` or `TF_ROCE_*` variable is passed to both ranks (export it in `scripts/local.sh`; `.env` lines are).
+
+`TF_GLM_MULTI_DEPTH=joint` is optional. Unset is `policy`, and that stays the default. Upstream #198 reported +11% to
++50% output throughput on 2× GB10 with 2K-32K prompts, concurrency 1 and 4, and 512 output tokens, changing only
+that variable and `TF_GLM_MULTI_OVERHEAD_MS=12` on both ranks. A second 2× GB10 measurement (short prompts of 14 and
+25 tokens, 256 output tokens, `PARALLEL=2`) saw −3.5% to +3.3% and did not treat the difference as a repeatable gain.
+The workloads are not the same, and the second run also saw different KV pools between the two starts. To compare
+here, keep every other setting, the prompt lengths and the KV budget the same, alternate which arm is started first,
+and repeat. Rank 0 should log `depth joint (overhead 12 ms)`. Check a greedy reply (`"temperature": 0`) still matches
+`policy` before relying on `joint`. This fork has not measured it.
+
+```bash
+TF_GLM_MULTI_DEPTH=joint TF_GLM_MULTI_OVERHEAD_MS=12 ./start.sh restart
+```
 
 **Revision pins.** The checkpoint and DFlash2 are pinned to the revisions this recipe was measured with
 (`MODEL_REVISION`, `DFLASH2_REVISION`): both ranks serve exactly those from the local cache, and a new upstream commit
@@ -937,10 +971,18 @@ The checkpoint's own sampling defaults apply (temperature 1.0, top_p 0.95). Per 
   then parses, else returned as text; a missing `<arg_key>` is put back), with arguments typed by their schema (an array as a JSON array,
   `null` and `const` values as such). Calls written inside the think block count when the reply ends on them, and a
   tool-calling step's reasoning is put back into the next request when an agent client drops it
-  (`TF_GLM_KEEP_REASONING=0` turns that off). A past tool call whose arguments are not a JSON object is left out of
+  (`TF_GLM_KEEP_REASONING=0` turns that off; that is also the opt-in workaround for fill stalls and a rank 0
+  SIGSEGV on long agent sessions, [above](#quick-start), ashhart/TensorFold #993). A past tool call whose arguments are not a JSON object is left out of
   the prompt with its result (and logged) instead of failing the request.
 - **Structured outputs:** `response_format` (`json_object` or `json_schema`) and the `guided_json` / `guided_regex` /
   `guided_choice` / `guided_grammar` / `structured_outputs` fields, enforced with xgrammar (after the think block).
+- **Quoted control tokens:** text in a chat request that only spells an added token (`<think>`, `</think>`, `<|user|>`,
+  `<tool_call>`, including in a system message, a tool result or a tool's description) is tokenized as ordinary text
+  (patch `0121`). The template's own control tokens are unchanged. `/nothink` still switches thinking off, and an
+  assistant turn that carries its reasoning inline (`<think>...</think>` with no `reasoning_content`) is left for the
+  template to split. `TF_GLM_LITERAL_TOKENS=0` restores Python server v0.6.0, which turned those spellings into the
+  tokens (ashhart/TensorFold #1117; the native server fixed the same bug in v1.1.2). `/completions` is not a chat
+  render and is unchanged. A request that already contains one of the private-use mask characters is left unmasked.
 - **`/tokenize` / `/detokenize`:** vLLM's fields; a `prompt` or `messages` (rendered as the chat route does) to token
   ids with their `count` and `max_model_len`, and back.
 - Refused with HTTP 400: `logprobs: true` / `top_logprobs` (this engine returns no token probabilities) and `n`
@@ -989,7 +1031,9 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | End of turn | `0075-glm-assistant-ends` | `<\|assistant\|>` ends a reply like the checkpoint's end tokens: the model sometimes started a second answer with it at high reasoning effort, and the raw token reached the reply's text (issue #60); `TF_GLM_ASSISTANT_ENDS=0` keeps the checkpoint's end tokens; the ranks check they agree at start | replies without the token unchanged |
 | Loop guard | `0091-glm-loop-guard` | `TF_GLM_LOOP_GUARD=1` (off by default): a think block that collapsed into repeating itself (an exact cycle of up to 16 tokens held for 256 tokens, or one token taking half of the last 256) is closed with the thinking budget's close and the model answers from there (issues #89, #94); `usage.tensorfold.loop_guard` counts it | off: nothing changes; on: a looping reply ends instead of running to `max_tokens` |
 | Picture cache | `0079-glm-picture-cache` | the vision frontend reads a request's pictures once, not on every turn of the chat: what reading each source cost (rows, key, digest, canvas) is kept by the source's bytes and handed back on later turns (host memory only; `TENSORFOLD_GLM_PICTURE_CACHE`, by ThomasWadeZ, #63). The cap counts source bytes, not canvases; `TENSORFOLD_GLM_PICTURE_CACHE=0` if rank 0's RSS climbs under image load (upstream #154) | 10 pictures in a chat, a later turn's first token 0.43-0.46 s -> 0.16-0.19 s; prompt tokens and replies identical |
+| MPO JPEG | `0120-vision-mpo-jpeg` | an iPhone camera JPEG (MPO, two frames, or three for Ultra HDR) is accepted as its first frame; the animated/multipage guard no longer refuses it (upstream #201). Animated WebP and every other multipage format stay refused | `tools/mpo_jpeg_check.py` on CPU; a phone photo through the API still needs the two Sparks |
 | Quoted markers | `0080-vision-quoted-markers` | every picture and clip of a request is marked with a per-request nonce, and a marker not behind one stays text: quoting the template's picture span in a prompt, a log or a refusal no longer counts as media, while a template or client that drops a picture is still refused (by ThomasWadeZ, #64) | a request quoting the picture span beside a real picture: 400 -> 200, the right answer |
+| Literal control tokens | `0121-glm-literal-added-tokens` | a spelling of an added token in chat-request text (a user or system message, a tool result, a tool definition, restored reasoning) is masked before the template renders and encoded as ordinary text; the template's own control tokens stay tokens. On by default (`TF_GLM_LITERAL_TOKENS=0` turns it off). `/completions` is unchanged (ashhart/TensorFold #1117) | `tools/literal_tokens_check.py` on CPU against the checkpoint tokenizer; a greedy reply on the two Sparks is still unchecked |
 | Capacity status | `0081-tfcap-capacity-status` | every capacity refusal renders the same way: 429 with `Retry-After: 5` (was a bare 503 at two sites, a 400 on the generate path) (by johnwhited, #48) | a refused request's client can back off instead of stacking |
 | Admission control | `0082-tfcap-admission-cap` | `TF_GLM_MAX_QUEUED` (unset: queue, as before; a number: past the lanes plus that many queued foreground requests, refuse) turns saturation into a refusal instead of an invisible queue (by johnwhited, #48) | with `TF_GLM_MAX_QUEUED=0`, the fifth request on four lanes: 429 at once with `Retry-After: 5`; unset, it queues as before |
 | Delivery abort | `0083-tfcap-delivery-abort` | a stream whose delivery callback raises (broken pipe, reset, timeout) ends at once and frees its lane, instead of the exception escaping and the lane leaking until generation ends (by johnwhited, #48) | a client that dies mid-reply no longer holds a lane |
@@ -1059,9 +1103,11 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 | `tools/kv_shard_mutants.sh` | the shard check must fail on each faithful mutant of the carry (a guard, rule or step taken out or turned the wrong way): 63, all killed |
 | `tools/pool_room_check.py` | patch 0074's checks, run in the image (`docker run ... --entrypoint python`, see the file): the pool's room-making on a CPU arena, what it evicts and moves, and rank 1 replaying the same ops |
 | `tools/parked_pages_check.py` | patch 0119's checks, run in the image (`docker run ... --entrypoint python`, see the file) or against the patched source with `PYTHONPATH`: the start-up budget's count of the pages parked on the kernel's per-CPU free lists beyond their resting level, on synthetic zoneinfo / meminfo files (several CPUs, zones and nodes, a warm start, no `high_min`, no page lists, unreadable and garbled files) and the `available_bytes` / `page_room` figures that include them; no GPU, no model |
+| `tools/mpo_jpeg_check.py --source-root DIR` | patch 0120's checks on the CPU (needs Pillow): a 2-frame MPO and a 3-frame MPO decode as frame 0, a single-frame JPEG is unchanged, and an animated WebP is still refused; `--expect-stock` against unpatched source expects the 2-frame MPO to be refused |
 | `tools/test_queued_cancellation.py --source-root DIR` | patch 0073's checks on the CPU, against TensorFold's source with the patches applied (no GPU, no server): requests that wait while every slot is busy and whose client leaves are dropped at once, in queue order; `--expect-stock` before 0073 shows the old wait |
 | `tools/end_of_turn.py [label] [max_cut]` | 8 short French coding prompts, thinking off: counts the replies that run to `max_tokens` (48 requests) and measures P(end of turn) right after each reply's closing code fence; exit 1 above `max_cut` cut replies (default 4) |
 | `tools/prompt_reuse.py [size]` | a ~33k-token conversation takes three more turns, each after a request of another conversation with the same system prompt (an agent and its sub-agents); exit 1 when a turn resumes less than 90% of its prompt. Needs `PARALLEL` above 1 |
+| `tools/literal_tokens_check.py DIR` | patch 0121's checks on the CPU, against TensorFold's source with the patches applied (`PYTHONPATH`) and the checkpoint dir (its `tokenizer.json` and chat template; no GPU, no server): quoted control tokens stay text, the template's own tokens do not, `/nothink` and inline assistant reasoning stay as before, `TF_GLM_LITERAL_TOKENS=0` turns it off, and the vision frontend encodes through the same path |
 
 ## Repository layout
 

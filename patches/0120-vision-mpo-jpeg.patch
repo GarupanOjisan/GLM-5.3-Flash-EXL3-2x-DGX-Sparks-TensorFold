@@ -1,0 +1,22 @@
+# iPhone camera JPEGs are MPO: Pillow reports n_frames == 2 (the picture, then a depth or gain map),
+# so the guard that refuses animated GIF / APNG / WebP also refused every phone photo with HTTP 400
+# (upstream #201). An MPO is its first frame; source.load() already returns that frame. Any MPO frame
+# count is accepted (n_frames == 2 is what an iPhone writes; Ultra HDR can carry one more auxiliary
+# frame). Animated WebP and every other multipage format stay refused. Apache-2.0.
+
+diff --git tensorfold/vision/images.py tensorfold/vision/images.py
+--- tensorfold/vision/images.py
++++ tensorfold/vision/images.py
+@@ -211,7 +211,11 @@
+                 if (min(width, height) <= 0 or max(width, height) > limits.max_dimension
+                         or width * height > min(limits.max_pixels, remaining_pixels)):
+                     raise ImageInputError("image dimensions exceed the decoded pixel limit")
+-                if getattr(source, "n_frames", 1) != 1:
++                # MPO (every iPhone camera JPEG; Android Ultra HDR uses the same container) reports n_frames
++                # of 2 or more. Frame 0 is the picture; later frames are auxiliary (depth, gain map, preview).
++                # source.load() below returns frame 0. GIF / APNG / animated WebP stay refused.
++                frames = getattr(source, "n_frames", 1)
++                if frames != 1 and getattr(source, "format", None) != "MPO":
+                     raise ImageInputError("animated and multipage images are unsupported; send a single frame")
+                 source.verify()
+             with image.open(io.BytesIO(data), formats=_FORMATS) as source:
