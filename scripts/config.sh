@@ -260,6 +260,10 @@ export TF_GLM_EFFORT_TAIL="${TF_GLM_EFFORT_TAIL:-0}"
 # added token (<think>, <|user|>, <tool_call>, a tool description, a tool result) as that token
 # (ashhart/TensorFold #1117). /completions is unchanged. Export 0 to turn it off; start.sh forwards every TF_GLM_* name.
 #   TF_GLM_LITERAL_TOKENS=0 ./start.sh restart
+# Reply markup is markup only at the reply's own marker tokens (patch 0123, on in GlmApp). Not set here: a missing
+# TF_GLM_REPLY_IDS is 1 inside the server. 0 restores the text parse, where a spelled </think> or <tool_call> counts
+# as markup. Other families' App stays off. Export 0 to turn it off; start.sh forwards every TF_GLM_* name.
+#   TF_GLM_REPLY_IDS=0 ./start.sh restart
 # Admission at saturation (patch 0075): past the lanes plus MAX_QUEUED a foreground request is refused with
 # 429 + Retry-After (529 overloaded_error through the Anthropic bridge) instead of queueing invisibly. Unset
 # queues as every scheduler always has; 0 refuses anything past the lanes. A single-instance deployment with

@@ -35,6 +35,11 @@ jobs:
           python -m pip install --disable-pip-version-check tokenizers jinja2 numpy
           MD="$RUNNER_TEMP/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/rev"
           PYTHONPATH=/tmp/tf/src python tools/literal_tokens_check.py "$MD"
+      - name: Reply markup is read at its marker tokens
+        run: |
+          python -m pip install --disable-pip-version-check tokenizers jinja2
+          MD="$RUNNER_TEMP/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/rev"
+          PYTHONPATH=/tmp/tf/src python tools/reply_ids_check.py "$MD"
       - name: Start-up budget counts the parked pages (synthetic zoneinfo)
         run: PYTHONPATH=/tmp/tf/src python tools/parked_pages_check.py
       - name: iPhone MPO JPEG decodes as frame 0
