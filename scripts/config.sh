@@ -229,6 +229,11 @@ export TF_GLM_CACHE_SHARE_PCT="${TF_GLM_CACHE_SHARE_PCT:-0}"
 # /health shows kept_bytes, kept_bytes_cap and kept_mix.
 export TF_GLM_KEPT_BYTES_GIB="${TF_GLM_KEPT_BYTES_GIB:-0}"
 export TF_GLM_KEEP_PER_CHAT="${TF_GLM_KEEP_PER_CHAT:-0}"
+# TF_GLM_KEEP_REASONING (patch 0036; not set here, so TensorFold's default stands: 1024 kept replies,
+# TF_GLM_KEEP_REASONING_MB 32). 0 turns restoration off. Opt-in workaround when a long agent session stalls in
+# fill ("decode 0, fill 1") and rank 0 then SIGSEGVs (ashhart/TensorFold #993). The cause is not confirmed on
+# this pin. Export it; start.sh forwards every TF_GLM_* name. While capturing a stall set
+# TF_GLM_MULTI_WATCHDOG_S=30 and leave TF_GLM_MULTI_WATCHDOG_EXIT=0 (1 exits after the first dump). README.
 # Earlier turns keep their reasoning in the prompt (patch 0060), as in zai-org's current template. 1: drop it, as the
 # checkpoint's template does; agents then prefill the previous turn's tool loop again at each new user message.
 export TF_GLM_CLEAR_THINKING="${TF_GLM_CLEAR_THINKING:-0}"
