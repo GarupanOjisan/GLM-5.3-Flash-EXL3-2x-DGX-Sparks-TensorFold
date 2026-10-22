@@ -30,6 +30,7 @@
 #            STATE_DIR, HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
 #            CUDA_ALLOC_CONF (PYTORCH_CUDA_ALLOC_CONF for every rank; default expandable_segments:True, "" unsets)
 #   tokens   TF_GLM_LITERAL_TOKENS (1, the default: a control-token spelling in request text stays text; 0 turns that off)
+#            TF_GLM_REPLY_IDS (1, the default: reply markup is read at its marker tokens; 0 turns that off)
 #   image    IMAGE, TF_VERSION, TF_REPO, BASE_IMAGE, GHCR_IMAGE, IMAGE_TAG / IMAGE_DIGEST (the pinned published
 #            image), CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), PULL, MIN_FREE_GB, IMAGE_FREE_GB, RSYNC_OPTS, HF_TOKEN (prepare.sh's downloads;
@@ -127,6 +128,9 @@ fi
 [[ "$TF_ROCE_MAX_KB" =~ ^[1-9][0-9]*$ ]] || die "TF_ROCE_MAX_KB is a size in KiB (512: up to 32-row windows over RoCE), not $TF_ROCE_MAX_KB"
 if [[ -n "${TF_GLM_LITERAL_TOKENS:-}" ]]; then
   [[ "$TF_GLM_LITERAL_TOKENS" =~ ^[01]$ ]] || die "TF_GLM_LITERAL_TOKENS is 0 or 1 (1: request text stays text), not $TF_GLM_LITERAL_TOKENS"
+fi
+if [[ -n "${TF_GLM_REPLY_IDS:-}" ]]; then
+  [[ "$TF_GLM_REPLY_IDS" =~ ^[01]$ ]] || die "TF_GLM_REPLY_IDS is 0 or 1 (1: reply markup is read at its marker tokens), not $TF_GLM_REPLY_IDS"
 fi
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
 [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
