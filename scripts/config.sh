@@ -239,6 +239,11 @@ export TF_GLM_CLEAR_THINKING="${TF_GLM_CLEAR_THINKING:-0}"
 # check the effort levels still answer differently (tools/toolcheck.py, tools/end_of_turn.py) before relying on it.
 # Not a request field: it changes every thinking-on prompt, and every rank reads it with the other TF_GLM_* switches.
 export TF_GLM_EFFORT_TAIL="${TF_GLM_EFFORT_TAIL:-0}"
+# Control-token spellings in a chat request stay text (patch 0121, on by default). Not set here: a missing
+# TF_GLM_LITERAL_TOKENS is 1 inside the server. 0 restores Python server v0.6.0, which encoded a spelling of an
+# added token (<think>, <|user|>, <tool_call>, a tool description, a tool result) as that token
+# (ashhart/TensorFold #1117). /completions is unchanged. Export 0 to turn it off; start.sh forwards every TF_GLM_* name.
+#   TF_GLM_LITERAL_TOKENS=0 ./start.sh restart
 # Admission at saturation (patch 0075): past the lanes plus MAX_QUEUED a foreground request is refused with
 # 429 + Retry-After (529 overloaded_error through the Anthropic bridge) instead of queueing invisibly. Unset
 # queues as every scheduler always has; 0 refuses anything past the lanes. A single-instance deployment with
