@@ -223,6 +223,23 @@ in one step prints every thread's stack, then exits; restart the pair from a sup
 (`requests_running` above 0 with those counters frozen). `stop.sh` saves both ranks' logs; attach them to #163.
 `SPLIT=0` takes `hcsplit` out of the path, but nobody has confirmed in #163 that it avoids the wedge.
 
+**Fill stalls and a rank 0 SIGSEGV on long agent sessions (ashhart/TensorFold #993, open, no fix yet).** On an older
+pin than this fork's, a 2× Spark TP=2 server intermittently sat in "decode 0, fill 1" for 14-20 s (`/health`
+`iteration_s`), then rank 0 died with SIGSEGV (exit 139) while rank 1 waited. The stacks were in `kept_reasoning`
+(`signature` / `_keys` / `restore`) and `multi._fill`. `TF_GLM_KEEP_REASONING=0` then ran for hours with `kept_prompts`
+at 32 and the pool nearly full. The cause is not identified, and it has not been reproduced on this fork's pin
+(`3fd60dfc` / `e66c657a433d`). The variable already exists (patch `0036`, default 1024 kept replies and 32 MiB) and
+`start.sh` forwards every exported `TF_GLM_*` name to both ranks. To compare, without changing the default:
+
+```bash
+TF_GLM_KEEP_REASONING=0 ./start.sh restart
+```
+
+The cost: when an agent drops a tool step's reasoning, the server no longer puts it back (see [Tool calling](#api-notes)
+below). To capture a stall without killing the process, set `TF_GLM_MULTI_WATCHDOG_S=30` and leave
+`TF_GLM_MULTI_WATCHDOG_EXIT=0` (the default). `EXIT=1` dumps stacks and then exits. Watch `/health`'s `iteration_s`
+next to `streams.*`. Unset `TF_GLM_KEEP_REASONING` (or set it back to `1024`) to restore the default.
+
 If `start.sh` stops at a check:
 
 | Message | What to do |
@@ -919,7 +936,8 @@ The checkpoint's own sampling defaults apply (temperature 1.0, top_p 0.95). Per 
   then parses, else returned as text; a missing `<arg_key>` is put back), with arguments typed by their schema (an array as a JSON array,
   `null` and `const` values as such). Calls written inside the think block count when the reply ends on them, and a
   tool-calling step's reasoning is put back into the next request when an agent client drops it
-  (`TF_GLM_KEEP_REASONING=0` turns that off). A past tool call whose arguments are not a JSON object is left out of
+  (`TF_GLM_KEEP_REASONING=0` turns that off; that is also the opt-in workaround for fill stalls and a rank 0
+  SIGSEGV on long agent sessions, [above](#quick-start), ashhart/TensorFold #993). A past tool call whose arguments are not a JSON object is left out of
   the prompt with its result (and logged) instead of failing the request.
 - **Structured outputs:** `response_format` (`json_object` or `json_schema`) and the `guided_json` / `guided_regex` /
   `guided_choice` / `guided_grammar` / `structured_outputs` fields, enforced with xgrammar (after the think block).

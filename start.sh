@@ -41,6 +41,9 @@
 #   ranks    every TENSORFOLD_*, TF_GLM_* and TF_ROCE_* variable goes to every rank (TP>2: TF_ROCE_HCA per node, found),
 #            e.g.
 #            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
+#   agents   TF_GLM_KEEP_REASONING=0 leaves a dropped tool step's reasoning unrestored (fill-stall / SIGSEGV
+#            workaround, ashhart/TensorFold #993; default stays 1024). TF_GLM_MULTI_WATCHDOG_S=30 with
+#            TF_GLM_MULTI_WATCHDOG_EXIT=0 records stacks and keeps the process up
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
