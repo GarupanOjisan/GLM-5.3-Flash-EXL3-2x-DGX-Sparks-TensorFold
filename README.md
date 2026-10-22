@@ -825,6 +825,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `MAX_TOKENS` | `32768` | the reply budget (reasoning and answer) of a request that sets no `max_tokens`; TensorFold's own default is 4,096 |
 | `THINKING` | `1` (`0` with `ABLIT=1`) | think before answering by default; `0` answers directly unless a request asks to think |
 | `VISION` / `VISION_URLS` | `1` / `0` | image and video input; `1` also accepts public `https://` URLs |
+| `TF_GLM_LITERAL_TOKENS` | `1` | a spelling of a control token in chat-request text stays ordinary text (patch `0121`). Unset is the same as `1`. `0` restores Python server v0.6.0, which turned that spelling into the token (ashhart/TensorFold #1117). `/completions` is unchanged |
 | `COMM` | `roce` | the ranks' small all-gathers as one-shot RDMA writes over the RoCE link; `nccl`: NCCL for all |
 | `SPLIT` | `1` | prompt chunks' hyper-connection work split between the Sparks, its exchanges overlapped with the next rows' work; when a rank's first NCCL connection fails with it (NCCL error 2, issue #36), `start.sh` tries once more, then starts with `SPLIT=0` and says so |
 | `KDA_CHUNKED` | `1` | KDA prompt chunks in chunked (WY) form, one CUDA kernel |
@@ -923,6 +924,13 @@ The checkpoint's own sampling defaults apply (temperature 1.0, top_p 0.95). Per 
   the prompt with its result (and logged) instead of failing the request.
 - **Structured outputs:** `response_format` (`json_object` or `json_schema`) and the `guided_json` / `guided_regex` /
   `guided_choice` / `guided_grammar` / `structured_outputs` fields, enforced with xgrammar (after the think block).
+- **Quoted control tokens:** text in a chat request that only spells an added token (`<think>`, `</think>`, `<|user|>`,
+  `<tool_call>`, including in a system message, a tool result or a tool's description) is tokenized as ordinary text
+  (patch `0121`). The template's own control tokens are unchanged. `/nothink` still switches thinking off, and an
+  assistant turn that carries its reasoning inline (`<think>...</think>` with no `reasoning_content`) is left for the
+  template to split. `TF_GLM_LITERAL_TOKENS=0` restores Python server v0.6.0, which turned those spellings into the
+  tokens (ashhart/TensorFold #1117; the native server fixed the same bug in v1.1.2). `/completions` is not a chat
+  render and is unchanged. A request that already contains one of the private-use mask characters is left unmasked.
 - **`/tokenize` / `/detokenize`:** vLLM's fields; a `prompt` or `messages` (rendered as the chat route does) to token
   ids with their `count` and `max_model_len`, and back.
 - Refused with HTTP 400: `logprobs: true` / `top_logprobs` (this engine returns no token probabilities) and `n`
@@ -972,6 +980,7 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | Loop guard | `0091-glm-loop-guard` | `TF_GLM_LOOP_GUARD=1` (off by default): a think block that collapsed into repeating itself (an exact cycle of up to 16 tokens held for 256 tokens, or one token taking half of the last 256) is closed with the thinking budget's close and the model answers from there (issues #89, #94); `usage.tensorfold.loop_guard` counts it | off: nothing changes; on: a looping reply ends instead of running to `max_tokens` |
 | Picture cache | `0079-glm-picture-cache` | the vision frontend reads a request's pictures once, not on every turn of the chat: what reading each source cost (rows, key, digest, canvas) is kept by the source's bytes and handed back on later turns (host memory only; `TENSORFOLD_GLM_PICTURE_CACHE`, by ThomasWadeZ, #63) | 10 pictures in a chat, a later turn's first token 0.43-0.46 s -> 0.16-0.19 s; prompt tokens and replies identical |
 | Quoted markers | `0080-vision-quoted-markers` | every picture and clip of a request is marked with a per-request nonce, and a marker not behind one stays text: quoting the template's picture span in a prompt, a log or a refusal no longer counts as media, while a template or client that drops a picture is still refused (by ThomasWadeZ, #64) | a request quoting the picture span beside a real picture: 400 -> 200, the right answer |
+| Literal control tokens | `0121-glm-literal-added-tokens` | a spelling of an added token in chat-request text (a user or system message, a tool result, a tool definition, restored reasoning) is masked before the template renders and encoded as ordinary text; the template's own control tokens stay tokens. On by default (`TF_GLM_LITERAL_TOKENS=0` turns it off). `/completions` is unchanged (ashhart/TensorFold #1117) | `tools/literal_tokens_check.py` on CPU against the checkpoint tokenizer; a greedy reply on the two Sparks is still unchecked |
 | Capacity status | `0081-tfcap-capacity-status` | every capacity refusal renders the same way: 429 with `Retry-After: 5` (was a bare 503 at two sites, a 400 on the generate path) (by johnwhited, #48) | a refused request's client can back off instead of stacking |
 | Admission control | `0082-tfcap-admission-cap` | `TF_GLM_MAX_QUEUED` (unset: queue, as before; a number: past the lanes plus that many queued foreground requests, refuse) turns saturation into a refusal instead of an invisible queue (by johnwhited, #48) | with `TF_GLM_MAX_QUEUED=0`, the fifth request on four lanes: 429 at once with `Retry-After: 5`; unset, it queues as before |
 | Delivery abort | `0083-tfcap-delivery-abort` | a stream whose delivery callback raises (broken pipe, reset, timeout) ends at once and frees its lane, instead of the exception escaping and the lane leaking until generation ends (by johnwhited, #48) | a client that dies mid-reply no longer holds a lane |
@@ -1044,6 +1053,7 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 | `tools/test_queued_cancellation.py --source-root DIR` | patch 0073's checks on the CPU, against TensorFold's source with the patches applied (no GPU, no server): requests that wait while every slot is busy and whose client leaves are dropped at once, in queue order; `--expect-stock` before 0073 shows the old wait |
 | `tools/end_of_turn.py [label] [max_cut]` | 8 short French coding prompts, thinking off: counts the replies that run to `max_tokens` (48 requests) and measures P(end of turn) right after each reply's closing code fence; exit 1 above `max_cut` cut replies (default 4) |
 | `tools/prompt_reuse.py [size]` | a ~33k-token conversation takes three more turns, each after a request of another conversation with the same system prompt (an agent and its sub-agents); exit 1 when a turn resumes less than 90% of its prompt. Needs `PARALLEL` above 1 |
+| `tools/literal_tokens_check.py DIR` | patch 0121's checks on the CPU, against TensorFold's source with the patches applied (`PYTHONPATH`) and the checkpoint dir (its `tokenizer.json` and chat template; no GPU, no server): quoted control tokens stay text, the template's own tokens do not, `/nothink` and inline assistant reasoning stay as before, `TF_GLM_LITERAL_TOKENS=0` turns it off, and the vision frontend encodes through the same path |
 
 ## Repository layout
 
