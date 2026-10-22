@@ -41,9 +41,11 @@
 #   decode   TF_GLM_L2PF (1), TF_GLM_EXL3_LOADS (nc), TF_ROCE_MAX_KB (512), TF_GLM_MULTI_LONE (0),
 #            TF_GLM_MULTI_WINDOW (32), TF_GLM_MULTI_DEPTH (unset: policy; joint is opt-in)
 #   ranks    every TENSORFOLD_*, TF_GLM_* and TF_ROCE_* variable goes to every rank (TP>2: TF_ROCE_HCA per node, found),
-#            plus MALLOC_ARENA_MAX when it is set (glibc arenas; it has none of those prefixes). e.g.
-#            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0,
-#            TENSORFOLD_GLM_PICTURE_CACHE=0, MALLOC_ARENA_MAX=2   # host RSS on rank 0 under heavy image use
+#            plus MALLOC_ARENA_MAX (unset: 2; "" leaves glibc's own arena count). e.g.
+#            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
+#   rss      MALLOC_ARENA_MAX=2 (the default) caps glibc arenas; the picture cache stays on.
+#            MALLOC_ARENA_MAX= restores glibc's default. TENSORFOLD_GLM_PICTURE_CACHE=0 is the fallback
+#            if rank 0's RSS still climbs (upstream #154)
 #   agents   TF_GLM_KEEP_REASONING=0 leaves a dropped tool step's reasoning unrestored (fill-stall / SIGSEGV
 #            workaround, ashhart/TensorFold #993; default stays 1024). TF_GLM_MULTI_WATCHDOG_S=30 with
 #            TF_GLM_MULTI_WATCHDOG_EXIT=0 records stacks and keeps the process up

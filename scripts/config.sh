@@ -346,15 +346,14 @@ export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
 # mixed-size requests a rank's device allocation ratchets up until the host runs out (#143). expandable_segments
 # lets the allocator grow and reclaim within one mapping instead; set CUDA_ALLOC_CONF to override or to "" to unset.
 CUDA_ALLOC_CONF="${CUDA_ALLOC_CONF-expandable_segments:True}"
-# Host RSS on rank 0 when a client sends many pictures (upstream #154). Neither is set here, so a start is unchanged.
-# TENSORFOLD_GLM_PICTURE_CACHE=0 turns off patch 0079's picture LRU. That LRU caps source bytes (384 MiB) and does not
-# count each entry's decoded canvas, so rank 0's RSS can climb by hundreds of MiB an hour while rank 1 stays flat.
-# The cost of 0 is the decode on later turns of the same pictures (10 pictures: first token 0.16-0.19 s with the
-# cache, 0.43-0.46 s without). Any exported TENSORFOLD_* name already reaches every rank.
-# MALLOC_ARENA_MAX=2 caps glibc's malloc arenas. Concurrent image requests have been seen to raise rank 0's thread
-# count (76 to 160) and leave arenas unreturned, so RSS steps up. The name is not TENSORFOLD_*/TF_GLM_*/TF_ROCE_*,
-# so start.sh forwards it only when it is set. One report: seven days flat, decode unchanged. It does not explain
-# the canvas climb above. Example: TENSORFOLD_GLM_PICTURE_CACHE=0 MALLOC_ARENA_MAX=2 ./start.sh restart
+# Rank 0 host RSS under picture load (upstream #154). The picture cache stays on (its own default). Unset
+# MALLOC_ARENA_MAX becomes 2. The name is not TENSORFOLD_*/TF_GLM_*/TF_ROCE_*, so start.sh passes it to every rank
+# itself. "" passes nothing, and glibc keeps its own arena count. A set value must be a positive integer.
+# Episode 4 there (cache on, MALLOC_ARENA_MAX=2, 44.3 h, 663M prompt tokens): rank 0 RSS 7.71 -> 8.24 GiB,
+# 5 MiB/h after warm-up, 3 MiB/h over the last 12 h. Cache off is the fallback (about 30 ms of TTFT a picture)
+# if RSS still climbs.   TENSORFOLD_GLM_PICTURE_CACHE=0 ./start.sh restart
+#                        MALLOC_ARENA_MAX= ./start.sh restart
+MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX-2}"
 # With more Sparks each holds fewer weights, so the pool can take more (the per-token KV cost is the same on every
 # rank: the latent cache is replicated). TP=3: 32 GiB leaves rank 0, the busiest, ~5 GiB under a 1M-token prompt
 # (at 27: 10.6 GiB lowest on rank 0, pool 5,257,216 tokens; at 32: 5,959,680).
