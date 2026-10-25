@@ -187,14 +187,34 @@ export TF_ROCE_MAX_KB="${TF_ROCE_MAX_KB:-512}"
 # down. A late peer now costs a slow round instead; a rank that is really gone is noticed after 300 s instead of 20,
 # like the watchdog's stall report (TF_GLM_MULTI_WATCHDOG_S, 300). NCCL's own gathers have no limit at all.
 export TF_ROCE_WAIT_S="${TF_ROCE_WAIT_S:-300}"
-# Prompt-lookup ("copy") drafts (patch 0007): when the reply's last 8 tokens occurred before, the tokens that followed
-# them are verified ahead of DFlash2's; quote / edit replies +5% (80.3 -> 84.4 tok/s), prose and code unchanged. Exact.
+# Prompt-lookup ("copy") drafts. The recipe names are COPY, COPY_MAX and COPY_CODE. A name set in the environment
+# wins; when that recipe name is unset, the engine name is accepted (TF_GLM_COPY, or else TF_GLM_COPY_DRAFTS, for
+# COPY; TF_GLM_COPY_MAX for COPY_MAX; TF_GLM_COPY_CODE for COPY_CODE). Both are then exported, so a container sees
+# one value.
+#   Python ./start.sh (patches 0007, 0013, 0032) reads TF_GLM_COPY_DRAFTS, TF_GLM_COPY_MAX, TF_GLM_COPY_MATCH,
+#     TF_GLM_COPY_REPLY_MATCH and TF_GLM_WIDE_GRAPHS. start.sh forwards every TF_GLM_* name, so the aliases go too.
+#     It does not read TF_GLM_COPY or TF_GLM_COPY_CODE; those are aliases for the v1.1.4 lane.
+#   ./start-native.sh (TensorFold 1.0.2 plus native/patches/0001) reads the same TF_GLM_COPY_DRAFTS / _MAX / _MATCH /
+#     _REPLY_MATCH names and TF_GLM_WIDE_GRAPHS. The patch defaults _MATCH to 8 when it is unset.
+#   ./start-tf114.sh (TensorFold v1.1.4 native CUDA, `tensorfold serve`) passes the same names into the container.
+#     Stock v1.1.4 does not read them: its GLM CUDA window is 8 rows, so a copy is at most 7 (one pending token and
+#     7 copies). GarupanOjisan/TensorFold's companion change ports the 16-row window and these variables. Until that
+#     binary reads them, extra env is ignored and the lane starts as before.
+# Patch 0007, COPY on: when the reply's last 8 tokens occurred before, the tokens that followed are verified ahead of
+# DFlash2's; quote / edit replies +5% (80.3 -> 84.4 tok/s), prose and code unchanged. Exact.
+[[ -n "${COPY+set}" ]] || COPY="${TF_GLM_COPY-${TF_GLM_COPY_DRAFTS-}}"
 COPY="${COPY:-1}"
 export TF_GLM_COPY_DRAFTS="$COPY"
+export TF_GLM_COPY="$COPY"
 # Copy drafts a round (patch 0013: verify windows up to 16 rows): 15 lets a long quote go through in one round; edit
-# replies 84 -> 119 tok/s, prose and code unchanged (two boots each). Exact.
+# replies 84 -> 119 tok/s, prose and code unchanged (two boots each). Exact. Stock v1.1.4 ignores COPY_MAX and stays
+# at 7 copies until the companion change.
+[[ -n "${COPY_MAX+set}" ]] || COPY_MAX="${TF_GLM_COPY_MAX-}"
 COPY_MAX="${COPY_MAX:-15}"
 export TF_GLM_COPY_MAX="$COPY_MAX"
+# How many tokens must match before a copy (patches 0007 and 0013, and 1.0.2's patch 0001). The engines default this
+# to 8 when it is unset; it is exported so the v1.1.4 container receives the same number. 2 to 64.
+export TF_GLM_COPY_MATCH="${TF_GLM_COPY_MATCH:-8}"
 # How many DFlash2 drafts a round verifies (patch 0018): fnc7:0.3 stops a chain when the product of each draft's chance
 # under the request's own keyed sampling noise drops below 0.3 (up to 7 drafts); prose 47.2 -> 50.6 tok/s, code 51.7 ->
 # 55.5 over fc5:0.3 (two boots each). Drafts only propose: replies are the same under every policy.
@@ -212,11 +232,14 @@ export TF_GLM_HC_SPLIT="$SPLIT" TF_GLM_PREFILL_OVERLAP="$([[ "$SPLIT" == 1 ]] &&
 KDA_CHUNKED="${KDA_CHUNKED:-1}"
 export TF_GLM_KDA_CHUNKED="$KDA_CHUNKED"
 # Code-workload copy drafts (patch 0032): 16-row verify windows as CUDA graphs, and a copy from the reply itself only
-# when its last 16 tokens match: code 55.4 -> 56.2 tok/s, edit 120 -> 125 (with the overlap above, two boots each).
-# Exact. 0: off.
+# when its last 16 tokens match: code 55.4 -> 56.2 tok/s, edit 120 -> 125 (with the overlap / SPLIT above, two boots
+# each). Exact. 0: off. Python and 1.0.2 read TF_GLM_WIDE_GRAPHS and TF_GLM_COPY_REPLY_MATCH (16 when on, 0 when off).
+# TF_GLM_COPY_CODE is the same switch under the name the v1.1.4 companion change reads.
+[[ -n "${COPY_CODE+set}" ]] || COPY_CODE="${TF_GLM_COPY_CODE-}"
 COPY_CODE="${COPY_CODE:-1}"
 _w=0; [[ "$COPY_CODE" == 1 ]] && _w=16
 export TF_GLM_WIDE_GRAPHS="$_w" TF_GLM_COPY_REPLY_MATCH="$_w"
+export TF_GLM_COPY_CODE="$COPY_CODE"
 # --parallel: a request alone runs on the one-stream graphs (patch 0035; 1) instead of the batched ones (0, default):
 # +0.6-0.9% at 1 stream, but to use them the stream moves to the pool's first rows and evicts the other conversations'
 # kept prompts there, so interactive sessions miss the prompt cache and re-read whole histories (issues #12, #13).

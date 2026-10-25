@@ -2,6 +2,8 @@
 # Serve GLM-5.3-Flash with TensorFold 1.0.2's native engine (Zig, no Python) on two DGX Sparks: rank 1 follows on the
 # worker (tf-glm follow), rank 0 here serves the OpenAI-compatible API (tensorfold-native serve). Same container name,
 # port, model and link settings as ./start.sh, so ./stop.sh stops either; ./start.sh brings the Python engine back.
+# Copy drafts: this 1.0.2 lane reads TF_GLM_COPY_DRAFTS, TF_GLM_COPY_MAX, TF_GLM_COPY_MATCH, TF_GLM_COPY_REPLY_MATCH
+# and TF_GLM_WIDE_GRAPHS (scripts/tf114-env.sh). v1.1.4 is ./start-tf114.sh, not this script.
 # What it does not have yet (README "Native engine"): no vision, no structured outputs. PARALLEL requests decode
 # together (default 4 with DRAFTER=dflash2, as ./start.sh); CONTEXT defaults to 262144 then (four lanes' caches fit),
 # 1048576 at PARALLEL=1. DRAFTER=dflash2 (the default) or mtp, COPY as ./start.sh.
@@ -10,7 +12,9 @@ set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 _ctx_env="${CONTEXT:-}"
 source ./scripts/config.sh
+source ./scripts/tf114-env.sh
 source ./scripts/nodes.sh
+tf114_check_copy
 
 MODE="${1:-start}"
 [[ "$MODE" == start || "$MODE" == restart ]] || die "usage: ./start-native.sh [start|restart]"
@@ -63,8 +67,8 @@ RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --device /dev/infi
 # An idle server waits up to ACCEPT_WAIT_MS for requests arriving together, so they prefill in one pass (0: at once).
 ENV_ARGS=(-e TF_GLM_PORT="$RANK_PORT" -e TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB" -e TENSORFOLD_NO_UPDATE_CHECK=1
           -e TENSORFOLD_ACCEPT_WAIT_MS="${ACCEPT_WAIT_MS:-20}" "${DRAFTER_ENV[@]}")
-for v in TF_GLM_KV TF_GLM_DENSE TF_GLM_KDA_CHUNKED TF_GLM_L2PF TF_GLM_COPY_DRAFTS TF_GLM_COPY_MAX \
-         TF_GLM_COPY_REPLY_MATCH TF_GLM_WIDE_GRAPHS TF_GLM_DFLASH_POLICY; do   # config.sh's settings the engine reads
+for v in TF_GLM_KV TF_GLM_DENSE TF_GLM_KDA_CHUNKED TF_GLM_L2PF TF_GLM_DFLASH_POLICY \
+         "${TF114_COPY_VARS[@]}"; do   # config.sh's settings the engine reads, including the copy aliases
   [[ -n "${!v:-}" ]] && ENV_ARGS+=(-e "$v=${!v}")
 done
 think=(); (( THINKING )) || think=(--no-thinking)

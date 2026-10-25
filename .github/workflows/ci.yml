@@ -48,6 +48,65 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check pillow
           python tools/mpo_jpeg_check.py --source-root /tmp/tf/src
+      - name: Copy-draft knobs reach the v1.1.4 container
+        run: |
+          bash -n start.sh start-native.sh start-tf114.sh scripts/config.sh scripts/tf114-env.sh
+          python tools/copy_draft_bench.py --self-check
+          env -i PATH="$PATH" HOME="$HOME" bash --noprofile --norc -c '
+            set -euo pipefail
+            source scripts/config.sh
+            test "$TF_GLM_COPY" = 1
+            test "$TF_GLM_COPY_DRAFTS" = 1
+            test "$TF_GLM_COPY_MAX" = 15
+            test "$TF_GLM_COPY_MATCH" = 8
+            test "$TF_GLM_COPY_CODE" = 1
+            test "$TF_GLM_COPY_REPLY_MATCH" = 16
+            test "$TF_GLM_WIDE_GRAPHS" = 16
+            test "$MALLOC_ARENA_MAX" = 2
+            test "$TF_GLM_KEPT_BYTES_GIB" = 1
+          '
+          env -i PATH="$PATH" HOME="$HOME" COPY=0 COPY_CODE=0 COPY_MAX=7 TF_GLM_COPY_MATCH=4 \
+            bash --noprofile --norc -c '
+            set -euo pipefail
+            source scripts/config.sh
+            test "$TF_GLM_COPY" = 0
+            test "$TF_GLM_COPY_DRAFTS" = 0
+            test "$TF_GLM_COPY_MAX" = 7
+            test "$TF_GLM_COPY_MATCH" = 4
+            test "$TF_GLM_COPY_CODE" = 0
+            test "$TF_GLM_WIDE_GRAPHS" = 0
+            test "$TF_GLM_COPY_REPLY_MATCH" = 0
+          '
+          env -i PATH="$PATH" HOME="$HOME" TF_GLM_COPY=0 TF_GLM_COPY_MAX=9 TF_GLM_COPY_CODE=0 \
+            bash --noprofile --norc -c '
+            set -euo pipefail
+            source scripts/config.sh
+            test "$COPY" = 0
+            test "$TF_GLM_COPY_DRAFTS" = 0
+            test "$COPY_MAX" = 9
+            test "$COPY_CODE" = 0
+            test "$TF_GLM_WIDE_GRAPHS" = 0
+          '
+          env -i PATH="$PATH" HOME="$HOME" TF_GLM_COPY_DRAFTS=0 bash --noprofile --norc -c '
+            set -euo pipefail
+            source scripts/config.sh
+            test "$COPY" = 0
+            test "$TF_GLM_COPY" = 0
+          '
+          env -i PATH="$PATH" HOME="$HOME" COPY=1 TF_GLM_COPY_DRAFTS=0 bash --noprofile --norc -c '
+            set -euo pipefail
+            source scripts/config.sh
+            test "$TF_GLM_COPY_DRAFTS" = 1
+          '
+          out=$(env -i PATH="$PATH" HOME="$HOME" DRY_RUN=1 TF114_IMAGE=example:1.1.4 bash --noprofile --norc ./start-tf114.sh)
+          printf '%s\n' "$out"
+          for v in TF_GLM_COPY TF_GLM_COPY_DRAFTS TF_GLM_COPY_MAX TF_GLM_COPY_MATCH TF_GLM_COPY_CODE TF_GLM_COPY_REPLY_MATCH TF_GLM_WIDE_GRAPHS; do
+            printf '%s\n' "$out" | grep -q -- "-e $v=" || { echo "missing $v"; exit 1; }
+          done
+          printf '%s\n' "$out" | grep -q -- "-e TF_GLM_COPY_MAX=15"
+          printf '%s\n' "$out" | grep -q "nothing was started"
+          # 1.0.2's launcher forwards the same copy names
+          grep -q 'TF114_COPY_VARS' start-native.sh
       - name: Image pin matches the patch set
         run: |
           # image_hash() from scripts/config.sh: sha256(cat patches/*.patch + IMAGE_EXTRAS)[:12]
