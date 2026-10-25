@@ -42,7 +42,8 @@
 #            TF_GLM_MULTI_WINDOW (32), TF_GLM_MULTI_DEPTH (unset: policy; joint is opt-in)
 #   ranks    every TENSORFOLD_*, TF_GLM_* and TF_ROCE_* variable goes to every rank (TP>2: TF_ROCE_HCA per node, found),
 #            plus MALLOC_ARENA_MAX (unset: 2; "" leaves glibc's own arena count). e.g.
-#            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
+#            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS (scripts/config.sh: MAX_IMAGES x
+#            IMAGE_TOKENS), TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
 #   rss      MALLOC_ARENA_MAX=2 (the default) caps glibc arenas; the picture cache stays on.
 #            MALLOC_ARENA_MAX= restores glibc's default. TENSORFOLD_GLM_PICTURE_CACHE=0 is the fallback
 #            if rank 0's RSS still climbs (upstream #154)
