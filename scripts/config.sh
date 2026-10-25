@@ -79,8 +79,8 @@ GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-ten
 # cannot) while patches/*.patch and IMAGE_EXTRAS still hash to IMAGE_TAG's hash. Other patches pull
 # $GHCR_IMAGE:<TF_VERSION>-<hash> when one is published, else build locally. scripts/publish-image.sh prints both.
 # The same image serves two and three Sparks.
-IMAGE_TAG="${IMAGE_TAG:-v0.6.0-e66c657a433d}"
-IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:14b5072e8e9918f1080153f57321415a387bc7d78cf9c9b44a7aeae2d4399ccf}"
+IMAGE_TAG="${IMAGE_TAG:-v0.6.0-789e8f3bdfa2}"
+IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:99fe7496d7002fd8f2ca3b1beb0aa07513835cd09989ca657b65875d60f69956}"
 # the registry reference prepare.sh pulls for these patches: the pinned digest, or the hash's tag
 prebuilt_image() {
   local tag="${TF_VERSION}-$(image_hash)"
@@ -245,10 +245,11 @@ export TF_GLM_COPY_CODE="$COPY_CODE"
 # kept prompts there, so interactive sessions miss the prompt cache and re-read whole histories (issues #12, #13).
 # Off by default until that move keeps them. Exact either way.
 export TF_GLM_MULTI_LONE="${TF_GLM_MULTI_LONE:-0}"
-# KV sharding (patch 0118, #152): each conversation's latent cache stored once, on the Spark that owns it, ~1.9x the
+# KV sharding (patch 0129, #152): each conversation's latent cache stored once, on the Spark that owns it, ~1.9x the
 # tokens in the same memory, replies byte-equal. ON BY DEFAULT IN THIS FORK (wojo) at two Sparks with more than one
-# stream, where it is tested (it needs --parallel above 1 and TF_GLM_MULTI_LONE=0; three Sparks are untested, four
-# refused). TF_GLM_KV_SHARD=0 turns it off; TF_GLM_KV_SHARD_CARRY=0 keeps it without the carry. README: KV sharding.
+# stream (it needs --parallel above 1 and TF_GLM_MULTI_LONE=0). Upstream leaves it off. The same shard code also
+# serves the tp4 branch (four Sparks). TF_GLM_KV_SHARD=0 turns it off; TF_GLM_KV_SHARD_CARRY=0 keeps it without the
+# carry. README: KV sharding.
 _kvs=0; (( TP == 2 && PARALLEL > 1 )) && [[ "$TF_GLM_MULTI_LONE" == 0 ]] && _kvs=1
 export TF_GLM_KV_SHARD="${TF_GLM_KV_SHARD:-$_kvs}"
 # --parallel: rows of every request's verify window together in a round (patch 0069; TensorFold's TF_GLM_MULTI_WINDOW):
@@ -337,6 +338,11 @@ export TF_GLM_EFFORT_TAIL="${TF_GLM_EFFORT_TAIL:-0}"
 MAX_QUEUED="${MAX_QUEUED:-}"
 # A streamed request is checked before its 200 goes out (patch 0095), so it gets the same 429 + Retry-After.
 export TF_GLM_MAX_QUEUED="$MAX_QUEUED"
+# A streamed reply that has sent nothing for SSE_KEEPALIVE_S seconds writes an SSE comment line, ": keepalive" (patch
+# 0111). A request waiting for a lane or filling a long prompt is silent otherwise, and a proxy in front cuts an idle
+# stream (Cloudflare: after about two minutes, issue #106). Clients skip comment lines; the events are the same bytes.
+# Every streaming route (chat, completions, Messages, Responses). 0: off.
+export TENSORFOLD_SSE_KEEPALIVE_S="${SSE_KEEPALIVE_S:-${TENSORFOLD_SSE_KEEPALIVE_S:-15}}"
 # Sampled decode with the checkpoint's defaults (temperature 1, top_p 0.95, top_k 0) draws from the top_p nucleus
 # (patch 0034). Stock TensorFold tests each rank's candidates alone, which fails on any two ranks whenever both hold
 # part of the nucleus, so every such step gathered and sorted the whole vocabulary on the CPU: ~15 tok/s against
@@ -513,18 +519,21 @@ prepared_state() {
   echo "$line"
 }
 
-# Spill tier (patches 0088-glm-spill-tier and 0110-glm-spill-blocks, off by default): kept prompt states go to local
+# Spill tier (patches 0088-glm-spill-tier and 0128-glm-spill-blocks, off by default upstream): kept prompt states go to local
 # disk on each Spark when they are kept (PARALLEL above 1) and come back instead of a new prefill, also after a
 # restart or a crash. SPILL_GIB: the cap per Spark (0: off). SPILL_DIR: the same absolute path on every Spark (mounted
 # at /spill; files owned by your user). SPILL_QUOTA: the share of SPILL_GIB one conversation may hold before its own
 # old turns and forks go first (0: none). SPILL_TURNS: the newest states kept on a conversation's path; older turns
 # go as each one is written (each keeps a ~91 MB small part; 2 for heavy agent loops or a small disk, 8+ for chats with
-# deep edits, 0: every turn kept until room is needed).
+# deep edits, 0: every turn kept until room is needed). SPILL_RELEASE_MIB: the most MiB of rows copied to host memory
+# while they wait to be written (rows freed or overwritten before their write: on a GB10 that memory is the pool's and
+# the reserve's); unset, an eighth of MEMORY_RESERVE_GIB (1.8 GiB at 14.5); a state past it is not stored. One engine a
+# SPILL_DIR on each Spark: a second one finds it locked and runs without the tier.
 # SPILL_HIGHWATER: no longer used (states are written when kept). A clean stop writes what still waits within
 # SPILL_FLUSH_S seconds; STOP_TIMEOUT gives it the time. README: Spill tier.
 # ON BY DEFAULT IN THIS FORK (wojo): 64 GiB a Spark, a conversation up to a quarter of it (SPILL_QUOTA 0.25), as dogfooded
 # since 2026-10-09; it needs SPILL_MIN_FREE_GIB (50) free beside it on SPILL_DIR's disk, else writes are refused (no
-# error). SPILL_GIB=0 turns it off.
+# error). SPILL_GIB=0 turns it off. Upstream's own default is 0.
 SPILL_GIB="${SPILL_GIB:-64}"
 SPILL_DIR="${SPILL_DIR:-$HOME/.cache/tensorfold-spill}"
 SPILL_HIGHWATER="${SPILL_HIGHWATER:-0.70}"
@@ -536,9 +545,12 @@ SPILL_QUOTA="${SPILL_QUOTA:-${TF_GLM_SPILL_QUOTA:-0.25}}"
 export TF_GLM_SPILL_QUOTA="$SPILL_QUOTA"
 SPILL_TURNS="${SPILL_TURNS:-${TF_GLM_SPILL_TURNS:-4}}"
 export TF_GLM_SPILL_TURNS="$SPILL_TURNS"
+SPILL_RELEASE_MIB="${SPILL_RELEASE_MIB:-${TF_GLM_SPILL_RELEASE_MIB:-}}"
+[[ -z "$SPILL_RELEASE_MIB" ]] || export TF_GLM_SPILL_RELEASE_MIB="$SPILL_RELEASE_MIB"
 # A request whose prompt starts with what another request is still prefilling (a system prompt several agents share)
-# waits for that state instead of prefilling it beside it (patch 0110): six agents at once on a fresh 12k-token system
-# prompt answered in 15 s instead of 47 s. Same replies. PREFIX_WAIT=0 turns it off. README: A system prompt
+# waits for that state instead of prefilling it beside it (patch 0128): six agents at once on a fresh 12k-token system
+# prompt answered in 15 s instead of 47 s. Same replies. Upstream leaves PREFIX_WAIT off (0) because it changes
+# admission even with SPILL_GIB=0. This fork defaults to 1. PREFIX_WAIT=0 turns it off. README: A system prompt
 # prefilled once.
 PREFIX_WAIT="${PREFIX_WAIT:-1}"
 export TF_GLM_PREFIX_WAIT="$PREFIX_WAIT"

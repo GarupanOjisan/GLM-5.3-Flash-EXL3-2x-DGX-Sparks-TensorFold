@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/reply_ids_check.py <checkpoint dir>: patch 0123, run in the image (CPU only, the server stopped or not).
+"""tools/reply_ids_check.py <checkpoint dir>: patch 0117, run in the image (CPU only, the server stopped or not).
 
 GLM writes its markup (`</think>`, `<tool_call>`, `<arg_key>`, `<arg_value>` and their closers) as single tokens. The
 same text spelled in ordinary tokens (a quoted tag, an example call, a file being written) used to be read as markup
@@ -182,7 +182,7 @@ with tempfile.TemporaryDirectory() as d:
         print(f"{'ok  ' if good else 'FAIL'} {name}")
         for (patched, stream), (got, leak) in rows.items():
             mark = "" if got == want else ("  <- the bug" if not patched else "  <- WRONG")
-            print(f"     {'0123' if patched else 'text'} {'stream' if stream else 'whole '}: reasoning={got[0]!r} "
+            print(f"     {'0117' if patched else 'text'} {'stream' if stream else 'whole '}: reasoning={got[0]!r} "
                   f"content={got[1]!r} calls={got[2]!r}{'  INERT LEAKED' if leak else ''}{mark}")
 
 # the switch: GlmApp turns it on from the environment, 0 turns it off, every other family's App has none

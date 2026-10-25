@@ -57,13 +57,13 @@ worker_save_log() {
 }
 
 # _avail_gb: whole GiB available here, what `free -g` shows in its "available" column plus the pages parked on the
-# per-CPU free lists over their resting level, the figure TensorFold's budget starts from (patch 0119). The bulk free of
+# per-CPU free lists over their resting level, the figure TensorFold's budget starts from (patch 0122). The bulk free of
 # the image copy in prepare.sh (`docker save` / `docker load`) parks 5-9 GiB there for 1-2 minutes: the "count:" lines
 # under "pagesets" in /proc/zoneinfo, in neither MemFree nor MemAvailable. Runs on the workers too (the two helpers
 # below are sent over ssh with it): no config.sh there.
 # _parked_zone <page size>: "<parked KiB> <resting KiB>" from the per-CPU page lists, empty when there are none or a
 # value is not a number. Only the count: and high_min: lines under a zone's "pagesets" count, as in the engine
-# (capacity.parked_bytes in patch 0119). The resting level is the lists' high_min plus 256 MiB of slack (512 MiB when
+# (capacity.parked_bytes in patch 0122). The resting level is the lists' high_min plus 256 MiB of slack (512 MiB when
 # high_min is not listed): it undercounts a little, never overcounts.
 _parked_zone() {
   awk -v pg="$1" '{ t = $0; gsub(/^[ \t]+|[ \t]+$/, "", t) }
