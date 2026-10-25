@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks for patch 0119 (the startup budget counts the pages parked on the kernel's per-CPU free lists beyond their
+"""Checks for patch 0122 (the startup budget counts the pages parked on the kernel's per-CPU free lists beyond their
 resting level), run inside the image that scripts/prepare.sh built (CPU only: no GPU, no model, about a second):
 
     docker run --rm --entrypoint python -v "$PWD/tools/parked_pages_check.py:/c.py" tensorfold-glm53:v0.6.0 /c.py
@@ -95,7 +95,7 @@ def meminfo(total_gib, avail_gib):
 
 tempdir = tempfile.TemporaryDirectory()
 os.environ.pop("TENSORFOLD_MEMORY_RESERVE_GIB", None)
-check("capacity.parked_bytes exists (patch 0119 applied)", hasattr(capacity, "parked_bytes"))
+check("capacity.parked_bytes exists (patch 0122 applied)", hasattr(capacity, "parked_bytes"))
 
 MEM = meminfo(128, 100)
 unified = fake(True, free=10 * GIB, total=128 * GIB)

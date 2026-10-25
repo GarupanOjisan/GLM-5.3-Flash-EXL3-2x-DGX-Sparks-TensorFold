@@ -14,7 +14,7 @@
      return end, "reasoning"
 +
 +
-+# patch 0123 (TF_GLM_REPLY_IDS): GLM's reply markup, which its tokenizer holds as single tokens
++# patch 0117 (TF_GLM_REPLY_IDS): GLM's reply markup, which its tokenizer holds as single tokens
 +GLM_MARKERS = ("<think>", "</think>", "<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>",
 +               "</arg_value>")
 +_INERT = chr(0xE000)            # a spelled marker's last character while the parsers read it (the same length)
@@ -22,7 +22,7 @@
 +
 +
 +class ReplyMarks:
-+    """TF_GLM_REPLY_IDS (patch 0123, on unless 0): GLM's reply markup is markup only where the reply's own marker
++    """TF_GLM_REPLY_IDS (patch 0117, on unless 0): GLM's reply markup is markup only where the reply's own marker
 +    tokens wrote it. ``</think>``, ``<tool_call>`` and the argument tags are single tokens; the same text spelled in
 +    ordinary tokens (a quoted tag, an example call, an echoed document) is words. ``reply()`` follows one reply;
 +    its ``mask`` makes those spellings inert at the same length, so the text parsers (the think split, the call
@@ -112,7 +112,7 @@
          xml_stream = ToolCallStreamer(tools) if tools and not glm_calls and not policy.single else None
          answer_raw = [""]
          closing = [""]                       # what closes a GLM call the reply ended inside on an end token (#22)
-+        # patch 0123: GLM's markup is markup only at the reply's own marker tokens (TF_GLM_REPLY_IDS); the parsers
++        # patch 0117: GLM's markup is markup only at the reply's own marker tokens (TF_GLM_REPLY_IDS); the parsers
 +        # read the reply with its spelled markers inert, and what is sent has them back
 +        marks = getattr(self, "reply_ids", None) if chat else None
 +        reply_marks = marks.reply() if marks is not None else None
@@ -188,7 +188,7 @@
      def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
          super().__init__(engine, model_dir, served, **kwargs)
 +        from tensorfold.cuda.reply_text import ReplyMarks
-+        self.reply_ids = ReplyMarks.from_env(self.tok)      # patch 0123: the reply's markup at its marker tokens only
++        self.reply_ids = ReplyMarks.from_env(self.tok)      # patch 0117: the reply's markup at its marker tokens only
          if self.vision is not None:
              media_template(self.template, Path(model_dir))
          clear = os.environ.get("TF_GLM_CLEAR_THINKING", "0").strip() or "0"

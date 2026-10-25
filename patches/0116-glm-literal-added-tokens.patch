@@ -1,17 +1,7 @@
-# A quoted added token stays text. The chat route rendered the request into one string and encoded it
-# whole, so a spelling of an added token in a user message, a system message, a tool result, a tool
-# definition or a step's reasoning became that token (ashhart/TensorFold #1117, Python server v0.6.0).
-# The native server fixed the same bug in v1.1.2 by encoding request text with the added vocabulary off.
-# Here the request's strings are masked before the template renders (the template still writes its own
-# control tokens), and each mask is encoded as ordinary pieces of that spelling. A prompt with no such
-# spelling keeps its ids. Picture requests are masked on the same path; the vision frontend encodes
-# through encode_prompt while the request thread is bound. /completions is unchanged.
-# TF_GLM_LITERAL_TOKENS=0 turns it off. On by default. Apache-2.0.
-
 diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
 --- tensorfold/cuda/server.py
 +++ tensorfold/cuda/server.py
-@@ -215,28 +215,43 @@
+@@ -215,18 +215,27 @@
                  raise RequestError("messages must be a list")
              from tensorfold.server.prompts import has_images, prepare_images, tool_media_parts
  
@@ -24,66 +14,48 @@ diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
                  except TemplateError as exc:     # the checkpoint's template refuses the request (``raise_exception``)
                      raise RequestError(f"the chat template rejected the request: {exc}") from exc
  
--            # no --vision: a tool result's pictures as the template's own "unable to process" reminder (GLM)
--            reminded = (tool_media_parts(body["messages"]) if getattr(self, "tool_media_reminders", False)
--                        and getattr(self, "vision", None) is None else None)
--            if reminded is not None:
--                text = render(reminded, allow_images=True)
--            elif has_images(body["messages"]):
--                rendered = prepare_images(self.vision, body["messages"],
--                                          lambda messages: render(messages, allow_images=True),
--                                          context_limit=self._context_limit())
--                return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
--                                       self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
--                                       vision=rendered.vision, grammar=compiled, think_budget=budget)
--            else:
--                text = render(body["messages"])
--            prompt = self._encode_ids(text, False)
-+            # patch 0121: text from the request (a <think> quoted in a message, a <tool_call> in a file or in a tool's
++            # patch 0116: text from the request (a <think> quoted in a message, a <tool_call> in a file or in a tool's
 +            # description, a <|user|> in a log) stays text where a family sets ``literal`` (GLM): masked here, after
-+            # what the family adds to the messages, and encoded as text below. A picture request is masked too;
-+            # bind() is what the vision frontend's encode_prompt reads on this thread. /completions is below, untouched.
-+            from tensorfold.cuda.literal_tokens import bind, encode_prompt
-+
++            # what the family adds to the messages, and encoded as text below. Pictures go through prepare_images,
++            # unmasked.
 +            literal = getattr(self, "literal", None)
 +            messages, shown_tools, masked = body["messages"], tools, False
 +            if literal is not None:
 +                messages, shown_tools, masked = literal.mask(self._messages_to_mask(messages), tools)
-+            bind(literal if masked else None)
-+            try:
-+                # no --vision: a tool result's pictures as the template's own "unable to process" reminder (GLM)
-+                reminded = (tool_media_parts(messages) if getattr(self, "tool_media_reminders", False)
-+                            and getattr(self, "vision", None) is None else None)
-+                if reminded is not None:
-+                    text = render(reminded, shown_tools, allow_images=True)
-+                elif has_images(messages):
-+                    rendered = prepare_images(self.vision, messages,
-+                                              lambda messages: render(messages, shown_tools, allow_images=True),
-+                                              context_limit=self._context_limit())
-+                    return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
-+                                           self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
-+                                           vision=rendered.vision, grammar=compiled, think_budget=budget)
-+                else:
-+                    text = render(messages, shown_tools)
-+                prompt = encode_prompt(self.tok, text) if masked else self._encode_ids(text, False)
-+            finally:
-+                bind(None)
+             # no --vision: a tool result's pictures as the template's own "unable to process" reminder (GLM)
+-            reminded = (tool_media_parts(body["messages"]) if getattr(self, "tool_media_reminders", False)
++            reminded = (tool_media_parts(messages) if getattr(self, "tool_media_reminders", False)
+                         and getattr(self, "vision", None) is None else None)
+             if reminded is not None:
+-                text = render(reminded, allow_images=True)
++                text = render(reminded, shown_tools, allow_images=True)
+             elif has_images(body["messages"]):
+                 rendered = prepare_images(self.vision, body["messages"],
+                                           lambda messages: render(messages, allow_images=True),
+@@ -235,8 +244,8 @@
+                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
+                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
+             else:
+-                text = render(body["messages"])
+-            prompt = self._encode_ids(text, False)
++                text = render(messages, shown_tools)
++            prompt = literal.encode(self.tok, text) if masked else self._encode_ids(text, False)
          elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
              prompt = self.token_ids(body["prompt"])
          else:
-@@ -250,6 +265,12 @@
+@@ -249,6 +258,12 @@
+         # sampling is resolved here, so a malformed control is refused before a stream opens
          return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
                                 ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget)
- 
++
 +    def _messages_to_mask(self, messages: Any) -> Any:
-+        """The messages ``literal`` masks (patch 0121): as sent. A family that adds to them before its template
++        """The messages ``literal`` masks (patch 0116): as sent. A family that adds to them before its template
 +        renders them adds it here first, so what it adds is masked too and it reads the messages as sent."""
 +
 +        return messages
-+
+ 
      def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
          """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the vocabulary."""
- 
 diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
 --- tensorfold/families/glm5_next/cuda/app.py
 +++ tensorfold/families/glm5_next/cuda/app.py
@@ -99,10 +71,10 @@ diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_ne
              raise ValueError(f"TF_GLM_CLEAR_THINKING={clear!r}: expected 0 or 1")
          effort_tail_enabled()       # a typo fails at load, not at the first request
          self.template = ThinkingOffTemplate(self.template, KeptReasoning.from_env(), clear_thinking=clear == "1")
-+        self.literal = LiteralTokens.from_env(self.tok)     # patch 0121: added-token text in a request stays text
++        self.literal = LiteralTokens.from_env(self.tok)     # patch 0116: added-token text in a request stays text
 +
 +    def _messages_to_mask(self, messages: Any) -> Any:
-+        """The kept reasoning put back before the messages are masked (patch 0121): found by the messages as sent
++        """The kept reasoning put back before the messages are masked (patch 0116): found by the messages as sent
 +        (``remember`` keyed them so), and masked like reasoning a client sends back. The template's own ``restore``
 +        is then left only the steps found nowhere."""
 +
@@ -111,27 +83,11 @@ diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_ne
  
      def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
          """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
-diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
---- tensorfold/vision/glm.py
-+++ tensorfold/vision/glm.py
-@@ -728,8 +728,11 @@
-                 items.append(("video", clip.frames))
-                 rest = rest[v + len(VIDEO_SPAN):]
-         # patch 0099: the batch call tokenizes with Python's GIL released (encode holds it, ~1.2 us a token: a long
--        # prompt with a picture stopped the engine loop and every other stream), the same ids (as App._encode_ids)
--        ids = self.tok.encode_batch_fast(["".join(pieces)], add_special_tokens=False)[0].ids
-+        # prompt with a picture stopped the engine loop and every other stream), the same ids (as App._encode_ids).
-+        # patch 0121: while this thread is rendering a masked request, masks encode as ordinary text (encode_prompt).
-+        from tensorfold.cuda.literal_tokens import encode_prompt
-+
-+        ids = encode_prompt(self.tok, "".join(pieces))
-         if max_prompt_tokens and len(ids) >= max_prompt_tokens:
-             # v0.6.0's context refusal wording (68c6e35, Apache-2.0): served as context_length_exceeded
-             raise ValueError(f"{CONTEXT_LIMIT} {max_prompt_tokens} tokens: the prompt with its images is {len(ids):,} "
 diff --git tensorfold/cuda/literal_tokens.py tensorfold/cuda/literal_tokens.py
+new file mode 100644
 --- /dev/null
 +++ tensorfold/cuda/literal_tokens.py
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,177 @@
 +"""Added-token text inside a chat request, tokenized as text.
 +
 +The chat template renders the messages (and the tools' definitions) into one string and the server encodes it
@@ -148,25 +104,18 @@ diff --git tensorfold/cuda/literal_tokens.py tensorfold/cuda/literal_tokens.py
 +carries its reasoning inline (``<think>...</think>answer`` with no ``reasoning_content``: the template splits it
 +there), and a request that already holds one of the private-use characters used as masks.
 +
-+A picture request is masked the same way. ``bind`` holds the guard on the request thread while the vision frontend
-+encodes the rendered prompt (``encode_prompt``), so the text beside a picture is ordinary tokens too. ``/completions``
-+is not a chat render and is left alone.
-+
-+``TF_GLM_LITERAL_TOKENS=0`` turns it off. On by default: this is the control-token injection in Python server v0.6.0
-+(ashhart/TensorFold #1117; the same sentinel shape as the native encode-plain fix in v1.1.2).
++``TF_GLM_LITERAL_TOKENS=0`` turns it off.
 +"""
 +from __future__ import annotations
 +
 +import json
 +import os
 +import re
-+import threading
 +from typing import Any
 +
 +# Kept as a token even inside a user's text: GLM reads "/nothink" in a user turn as its no-thinking switch.
 +KEEP = frozenset({"/nothink"})
 +_BASE = 0xE000                      # Unicode private use area: one character per guarded token
-+_bound = threading.local()
 +
 +
 +class LiteralTokens:
@@ -287,29 +236,6 @@ diff --git tensorfold/cuda/literal_tokens.py tensorfold/cuda/literal_tokens.py
 +        for part in parts:
 +            ids.extend(self.plain[part] if part in self.plain else next(encoded).ids)
 +        return ids
-+
-+
-+def bind(guard: LiteralTokens | None) -> None:
-+    """The guard for the request this thread is rendering, or None. The vision frontend reads it in ``encode_prompt``."""
-+
-+    _bound.guard = guard
-+
-+
-+def bound() -> LiteralTokens | None:
-+    return getattr(_bound, "guard", None)
-+
-+
-+def encode_prompt(tok: Any, text: str) -> list[int]:
-+    """Ids of a rendered chat prompt. While ``bind`` holds a guard, masks encode as ordinary text; otherwise the
-+    whole string, added tokens included (``encode_batch_fast``, else ``encode``)."""
-+
-+    guard = bound()
-+    if guard is not None:
-+        return guard.encode(tok, text)
-+    fast = getattr(tok, "encode_batch_fast", None)
-+    if fast is not None:
-+        return list(fast([text], add_special_tokens=False)[0].ids)
-+    return list(tok.encode(text, add_special_tokens=False).ids)
 +
 +
 +def _as_text(tok: Any, text: str, added_ids: set[int]) -> list[int] | None:

@@ -321,7 +321,7 @@ fi
 # TensorFold budgets each Spark's free memory minus MEMORY_RESERVE_GIB (14.5); the defaults want ~110 GiB free at start on each.
 # With less, rank 0 refuses the window and names one that fits, which the load below then starts again with.
 # Memory freed in bulk a moment ago (prepare.sh's image copy) can still sit on the kernel's per-CPU free lists, outside
-# MemAvailable. It counts as available below, as in TensorFold's budget (patch 0119); see _avail_gb in scripts/nodes.sh.
+# MemAvailable. It counts as available below, as in TensorFold's budget (patch 0122); see _avail_gb in scripts/nodes.sh.
 here_gb=$(_avail_gb)
 low=0; (( here_gb >= 110 )) || low=1
 for i in $(worker_ids); do
