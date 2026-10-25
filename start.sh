@@ -40,6 +40,8 @@
 #            STOP_TIMEOUT (stop.sh); LOG_DIR, LOG_KEEP (saved server logs)
 #   decode   TF_GLM_L2PF (1), TF_GLM_EXL3_LOADS (nc), TF_ROCE_MAX_KB (512), TF_GLM_MULTI_LONE (0),
 #            TF_GLM_MULTI_WINDOW (32), TF_GLM_MULTI_DEPTH (unset: policy; joint is opt-in)
+#   copy     COPY, COPY_MAX, COPY_CODE (this Python path and ./start-native.sh on TensorFold 1.0.2). ./start-tf114.sh
+#            passes TF_GLM_COPY_MAX and the related names into a v1.1.4 container; stock v1.1.4 ignores them (7-row cap)
 #   ranks    every TENSORFOLD_*, TF_GLM_* and TF_ROCE_* variable goes to every rank (TP>2: TF_ROCE_HCA per node, found),
 #            plus MALLOC_ARENA_MAX (unset: 2; "" leaves glibc's own arena count). e.g.
 #            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS (scripts/config.sh: MAX_IMAGES x
@@ -53,6 +55,7 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
+source ./scripts/tf114-env.sh
 source ./scripts/nodes.sh
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
@@ -100,7 +103,7 @@ fi
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 [[ "$KV_POOL_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "KV_POOL_GIB is a number of GiB, not $KV_POOL_GIB"
 [[ "$MEMORY_RESERVE_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "MEMORY_RESERVE_GIB is a number of GiB, not $MEMORY_RESERVE_GIB"
-[[ "$COPY_MAX" =~ ^([1-9]|1[0-5])$ ]] || die "COPY_MAX is 1 to 15, not $COPY_MAX"
+tf114_check_copy   # COPY, COPY_MAX, COPY_CODE, TF_GLM_COPY_MATCH (scripts/tf114-env.sh)
 [[ "$DRAFT_POLICY" == f* ]] || die "DRAFT_POLICY is a DFlash2 policy (fc5:0.3, fnc7:0.3, fcost7:noisy ...), not $DRAFT_POLICY"
 # decode settings the ranks read at load (scripts/config.sh): checked here so a typo fails before anything is stopped
 [[ "$TF_GLM_MULTI_LONE" =~ ^[01]$ ]] || die "TF_GLM_MULTI_LONE is 0 or 1, not $TF_GLM_MULTI_LONE"

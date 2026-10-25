@@ -754,7 +754,10 @@ drafts, and several requests decoding together in one verify window (v1.10's seg
 
 `start-native.sh` reads the same settings (`scripts/config.sh`, `scripts/local.sh`): `MODEL_ID`, `PORT`, `CONTEXT`,
 `MAX_TOKENS`, `THINKING`, `MEMORY_RESERVE_GIB`, `WORKER`, the RoCE links, `DRAFTER` (`dflash2`, the default, or
-`mtp`), `COPY`, `COPY_MAX`, `DRAFT_POLICY`, `KV`, `DENSE`, `KDA_CHUNKED` and `PARALLEL`. It ignores `VISION`.
+`mtp`), `COPY`, `COPY_MAX`, `COPY_CODE`, `DRAFT_POLICY`, `KV`, `DENSE`, `KDA_CHUNKED` and `PARALLEL`. It ignores
+`VISION`. Copy drafts on this 1.0.2 lane are `TF_GLM_COPY_DRAFTS`, `TF_GLM_COPY_MAX`, `TF_GLM_COPY_MATCH` (8),
+`TF_GLM_COPY_REPLY_MATCH` and `TF_GLM_WIDE_GRAPHS`. TensorFold v1.1.4 is a different binary
+([below](#tensorfold-v114-native-cuda-lane)): stock v1.1.4 does not read those names.
 With `PARALLEL` above 1 and no `CONTEXT` set, the window is 262,144 tokens: each request gets a whole window of its
 own (no shared pool yet), and four at 1,048,576 need 51.3 GiB a Spark where 16.7 GiB is left after the weights.
 `ACCEPT_WAIT_MS` (default 20): an idle server waits this long for more requests before it starts on the first, so
@@ -765,7 +768,8 @@ comes that much later. `0` starts at once.
 7; the MTP head is not loaded, as v1.8's `TF_GLM_MTP=auto`), or with `DRAFTER=mtp` the checkpoint's MTP head. One
 request at a time, greedy, against v1.8 with `DRAFTER=dflash2 COPY=1 PARALLEL=1` on the same 13 prompts: the same
 replies and rounds, at 93-103% of v1.8's speed (code edit 102 tokens/s, v1.8 106; a quoted passage 136, v1.8 142;
-prose 44, v1.8 47). At 1,048,576 tokens about 20.6 GiB stays free with DFlash2 loaded.
+prose 44, v1.8 47). Those figures are this 1.0.2 lane (copy up to 15, windows up to 16 rows), not v1.1.4. At
+1,048,576 tokens about 20.6 GiB stays free with DFlash2 loaded.
 
 **Exactness.** Against v1.8 itself with its production GLM settings (`TF_GLM_DENSE=q4 TF_GLM_KV=fp8
 TF_GLM_KDA_CHUNKED=1 TF_GLM_EXL3_LOADS=nc TF_GLM_L2PF=1`, one stream, MTP drafts), greedy and token by token, with
@@ -848,6 +852,45 @@ conversations taking turns both prefill every time. With `PARALLEL` above 1 each
 rows: two conversations with 10.8k- and 11.5k-token system prompts taking turns prefilled once each (6.3 and 6.7 s),
 then resumed at 10,752 and 11,392 cached tokens every turn (0.4-0.6 s). The states take up to `--prompt-cache-gib` (default 2 GiB, about 27 states).
 
+## TensorFold v1.1.4 native CUDA lane
+
+`./start-tf114.sh` serves the same checkpoint with TensorFold v1.1.4's native CUDA lane (`tensorfold serve` on both
+ranks, `TF_GLM_RANK` / `TF_GLM_WORLD` and `NCCL_COMM_ID`). Set `TF114_IMAGE` to a v1.1.4 image; this recipe does not
+build one. `DRY_RUN=1` prints the docker arguments and does not start a container. `./stop.sh` stops it.
+`TF114_RECALL=1` adds `--recall` on both ranks. With `PARALLEL` above 1 and no `CONTEXT` in the environment, the
+window is 262,144 tokens, as `./start-native.sh`.
+
+Stock v1.1.4's GLM CUDA window is 8 rows, so a copy is at most 7 (one pending token and 7 copies), and the lane does
+not read `TF_GLM_COPY*`. `./start-tf114.sh` still passes `TF_GLM_COPY` (the `COPY` switch), `TF_GLM_COPY_DRAFTS`,
+`TF_GLM_COPY_MAX` (15), `TF_GLM_COPY_MATCH` (8), `TF_GLM_COPY_CODE` (the `COPY_CODE` switch), `TF_GLM_COPY_REPLY_MATCH`
+and `TF_GLM_WIDE_GRAPHS`. A companion change on GarupanOjisan/TensorFold ports the 16-row window and those variables.
+Until that binary reads them, the extra environment is ignored and the lane starts as the stock one does.
+
+Which path reads which knob:
+
+| Path | Reads | Copy width |
+| --- | --- | --- |
+| Python `./start.sh` (patches 0007, 0013, 0032) | `TF_GLM_COPY_DRAFTS`, `TF_GLM_COPY_MAX`, `TF_GLM_COPY_MATCH`, `TF_GLM_COPY_REPLY_MATCH`, `TF_GLM_WIDE_GRAPHS` | up to 15 drafts, windows up to 16 rows |
+| `./start-native.sh`, TensorFold 1.0.2 + `native/patches/0001` | the same names (`TF_GLM_COPY_MATCH` defaults to 8 in the patch) | up to 15 drafts, windows up to 16 rows |
+| `./start-tf114.sh`, TensorFold v1.1.4 CUDA | the container receives the names above, plus `TF_GLM_COPY` and `TF_GLM_COPY_CODE` | stock binary: at most 7 drafts, until the companion change |
+
+`TF_GLM_COPY` and `TF_GLM_COPY_CODE` are aliases. The Python and 1.0.2 lanes do not read those two names; they read
+`TF_GLM_COPY_DRAFTS` and, for `COPY_CODE`, `TF_GLM_WIDE_GRAPHS` / `TF_GLM_COPY_REPLY_MATCH`. When `COPY` is unset,
+`TF_GLM_COPY` is used, and otherwise `TF_GLM_COPY_DRAFTS`. When both a recipe name and its alias are set, the recipe
+name wins (`COPY`, `COPY_MAX`, `COPY_CODE`).
+
+Measured on the Python path (the numbers in `scripts/config.sh`; not remeasured on v1.1.4):
+
+- `COPY` on (patch 0007): quote / edit replies +5% (80.3 -> 84.4 tok/s), prose and code unchanged. Exact.
+- `COPY_MAX=15` (patch 0013, windows up to 16 rows): edit replies 84 -> 119 tok/s, prose and code unchanged (two boots each). Exact.
+- `COPY_CODE=1` (patch 0032): code 55.4 -> 56.2 tok/s, edit 120 -> 125 (with the overlap / `SPLIT`, two boots each). Exact.
+
+[MiaAI-Lab issue #208](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/208) compared a
+zig engine (`PARALLEL=8`, dense q4) with this recipe's Python path (`PARALLEL=2`, dense FP8). Short benches were
+faster on zig and question sets were slower. `PARALLEL` and `DENSE` were not the same on both sides, so that issue
+is not an engine-only comparison and not a copy-draft result. Compare lanes only when those two match.
+`tools/copy_draft_bench.py` records them and does not change the server.
+
 ## Configuration
 
 Every setting lives in [`scripts/config.sh`](scripts/config.sh). Set one for a single run from the environment
@@ -878,8 +921,8 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `TF_GLM_ASSISTANT_ENDS` | `1` | `<\|assistant\|>` ends a reply, like `<\|user\|>` and `<\|observation\|>` (patch 0075, issue #60); `0`: only the checkpoint's own end tokens |
 | `TF_GLM_LOOP_GUARD` | `0` | `1`: a think block that collapsed into repeating itself (an exact cycle of up to 16 tokens held for 256, or one token taking half of the last 256) is closed with the thinking budget's close, per request, and the model answers from there; `usage.tensorfold.loop_guard` counts it (patch 0091, issues #89 and #94). Paraphrase loops need `--thinking-budget` |
 | `DRAFT_POLICY` | `fnc7:0.3` | how many DFlash2 drafts a round verifies: up to 7, until the drafts' chance under the request's own sampling noise drops below 0.3 |
-| `COPY` / `COPY_MAX` | `1` / `15` | copy drafts: when the reply's last 8 tokens occurred before, the tokens that followed are verified ahead of DFlash2's, up to 15 a round |
-| `COPY_CODE` | `1` | 16-row verify windows as CUDA graphs, and copies from the reply itself only after a 16-token match |
+| `COPY` / `COPY_MAX` | `1` / `15` | copy drafts. Python and `./start-native.sh` (1.0.2 + patch 0001) read `TF_GLM_COPY_DRAFTS` and `TF_GLM_COPY_MAX`: when the reply's last 8 tokens (`TF_GLM_COPY_MATCH`) occurred before, the tokens that followed are verified ahead of DFlash2's, up to 15 a round. `COPY` on (patch 0007): quote / edit replies 80.3 -> 84.4 tok/s, prose and code unchanged. `COPY_MAX=15` (patch 0013): edit replies 84 -> 119 tok/s, prose and code unchanged (two boots each). Exact. `TF_GLM_COPY` is the same on/off switch for the v1.1.4 container; the Python and 1.0.2 lanes do not read that name. Stock v1.1.4 ignores both and caps a copy at 7 rows ([v1.1.4](#tensorfold-v114-native-cuda-lane)) |
+| `COPY_CODE` | `1` | 16-row verify windows as CUDA graphs, and copies from the reply itself only after a 16-token match. Python and 1.0.2 read `TF_GLM_WIDE_GRAPHS` and `TF_GLM_COPY_REPLY_MATCH` (16 when on, 0 when off). Patch 0032: code 55.4 -> 56.2 tok/s, edit 120 -> 125 (with the overlap / `SPLIT`, two boots each). Exact. `TF_GLM_COPY_CODE` is the alias `./start-tf114.sh` passes; stock v1.1.4 ignores it |
 | `SHARED_PREFIX` | `1` | conversations that share a system prompt reuse its prompt state |
 | `SPILL_GIB` / `SPILL_DIR` | `0` / `~/.cache/tensorfold-spill` | the spill tier: kept prompt states on local disk, written when kept, up to `SPILL_GIB` GiB a Spark (0: off) ([Spill tier](#spill-tier-optional)) |
 | `SPILL_QUOTA` / `SPILL_TURNS` | `0` / `4` | the spill tier's share of `SPILL_GIB` one conversation may hold before it trims its own old turns and forks (0: no quota), and the newest states kept on a conversation's path, older turns trimmed as each one is written (2: heavy agent loops or a small disk; 8+: chats with deep edits; 0: every turn until room is needed) |
@@ -1148,6 +1191,7 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 | `tools/prompt_reuse.py [size]` | a ~33k-token conversation takes three more turns, each after a request of another conversation with the same system prompt (an agent and its sub-agents); exit 1 when a turn resumes less than 90% of its prompt. Needs `PARALLEL` above 1 |
 | `tools/picture_turns.py [pictures] [size]` | a chat of ~`size` tokens (default 40000) gets one new 1920x1080 picture a turn (default 12), with a text turn after each; exit 1 when a turn re-reads more than the new picture, which is what a picture cap that moves with the picture count does from the 9th picture on. Needs the two Sparks |
 | `tools/picture_budget_check.py <checkout>` | the picture budget's checks, run in the image (`docker run ... --entrypoint python3`, see the file; CPU): `scripts/config.sh` and `start.sh` send every rank a budget under which a picture's cap is the same for 1 to `MAX_IMAGES` pictures, the environment's values win, and the workspace covers the budget's rows. `PYTHONPATH` to a patched TensorFold v0.6.0 tree runs the same check without the image |
+| `tools/copy_draft_bench.py` | copy-draft tok/s for echo, edit, code and prose at 1 and 4 streams, each prompt fresh (a nonce plus varied prose, so an n-gram cache cannot replay an earlier answer), and the token sha256 of each reply against the same prompt with `"draft": false`. `--recall` also GETs `/v1/recall` (a 404 that says recall is off is not a failure) and repeats one earlier passage. `--parallel` and `--dense` are recorded, not applied: [MiaAI-Lab #208](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/208) mixed `PARALLEL=8` dense q4 with `PARALLEL=2` dense FP8, so compare runs only when both match. `--self-check` needs no server |
 | `tools/literal_tokens_check.py DIR` | patch 0121's checks on the CPU, against TensorFold's source with the patches applied (`PYTHONPATH`) and the checkpoint dir (its `tokenizer.json` and chat template; no GPU, no server): quoted control tokens stay text, the template's own tokens do not, `/nothink` and inline assistant reasoning stay as before, `TF_GLM_LITERAL_TOKENS=0` turns it off, and the vision frontend encodes through the same path |
 | `tools/reply_ids_check.py DIR` | patch 0123's checks on the CPU, against the patched source (`PYTHONPATH`) and the checkpoint dir: through the chat route, whole and streamed, spelled markup stays text, a plain reply and a plain call match the old parse, and no inert character reaches a client; on in `GlmApp`, off with `TF_GLM_REPLY_IDS=0` and in other families |
 
@@ -1157,6 +1201,7 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 start.sh      set up (first run) and start both ranks
 start-tp3.sh  the same on three Sparks (experimental, patches 0066-0068)
 start-native.sh  TensorFold 1.0.2's native engine on two Sparks (experimental, native/)
+start-tf114.sh   TensorFold v1.1.4's native CUDA lane on two Sparks (`TF114_IMAGE`; passes the copy-draft env)
 stop.sh       stop them
 scripts/      config.sh (all settings), local.sh.example (this setup's WORKER, ABLIT), prepare.sh (image + checkpoint on
               both Sparks), nodes.sh (ssh and the RoCE links), publish-image.sh (push the image to GHCR),

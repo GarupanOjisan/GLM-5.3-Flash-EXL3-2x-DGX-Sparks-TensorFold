@@ -5,6 +5,14 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **Copy-draft knobs are documented per path, and `./start-tf114.sh` passes them into a TensorFold v1.1.4 container.**
+  `COPY`, `COPY_MAX` and `COPY_CODE` take effect on the Python path (patches 0007, 0013, 0032) and on
+  `./start-native.sh` (TensorFold 1.0.2 plus `native/patches/0001`). Stock v1.1.4's GLM CUDA lane does not read them
+  and caps a copy at 7 rows. The new launcher passes `TF_GLM_COPY`, `TF_GLM_COPY_DRAFTS`, `TF_GLM_COPY_MAX`,
+  `TF_GLM_COPY_MATCH`, `TF_GLM_COPY_CODE`, `TF_GLM_COPY_REPLY_MATCH` and `TF_GLM_WIDE_GRAPHS`; an engine that ignores
+  them starts as before. `tools/copy_draft_bench.py` reports tok/s for echo, edit, code and prose at 1 and 4 streams
+  on fresh prompts and checks the token sha against `"draft": false`. Comparisons need `PARALLEL` and `DENSE`
+  aligned (MiaAI-Lab issue #208). The measured effects cited in the README are the ones already in `scripts/config.sh`.
 - **`prepare.sh` warns when a node's NVIDIA CDI device cannot be confirmed** (by
   [SvangenStudios](https://github.com/SvangenStudios), upstream
   [pull request #207](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/207),
