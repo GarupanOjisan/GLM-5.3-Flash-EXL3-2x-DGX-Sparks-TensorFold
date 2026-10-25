@@ -231,14 +231,27 @@ export TF_GLM_CACHE_ENTRIES="${TF_GLM_CACHE_ENTRIES:-32}"
 # budget (~7.5 GiB on two Sparks at the defaults, where 32 states already take ~38%: 50 is ~42 states, 75 ~63). Any count is cut to 75% of the budget, logged at start. Watch
 # /health kept_prompts against pool_free_tokens: kept_prompts pinned at the count with a free pool is this symptom.
 export TF_GLM_CACHE_SHARE_PCT="${TF_GLM_CACHE_SHARE_PCT:-0}"
-# Two more limits on the kept states (patch 0089, both off by default; PR #65 by Thomas Wade): TF_GLM_KEPT_BYTES_GIB
-# caps the device memory the kept states own outside the pool (their DFlash2 window copies and recurrent state, ~45 MiB
-# each without a window, hundreds of MB with long ones), together: 0 is no cap, 4 is the author's value; past it the
-# least valuable state is dropped (by the same order as the entry count's) and freed blocks go back to the driver.
-# TF_GLM_KEEP_PER_CHAT keeps at most this many of one conversation's own turn-boundary states (the author runs 2; 0 is
-# no limit): one long chat can no longer fill the entries alone. Neither is written to the spill tier when it drops.
+# Two more limits on the kept states (patch 0089; PR #65 by Thomas Wade). TF_GLM_KEPT_BYTES_GIB caps the device
+# memory the kept states own outside the pool (their DFlash2 window copies and recurrent state, ~45 MiB each without
+# a window, hundreds of MB with long ones), together. The patch's own default is 0 (no cap): cached blocks are freed
+# only through _release(), and _release() runs only when this cap is set (multi.py:1136,1147), so an uncapped pool
+# does not hand that memory back and a heavy session still needs a restart (upstream #197). Past the cap the least
+# valuable state is dropped (the entry cap's order) and freed blocks go back to the driver. Dropped states are not
+# written to the spill tier.
+# This recipe's default is 1, the value upstream #197 measured. One run each, 2x GB10, recipe v1.10 (549fdc5), TP=2,
+# PARALLEL=2, FP8 KV, CONTEXT=1048576, three synthetic agents growing their own chats to 400k tokens:
+#   no cap: kept_bytes 3,033,160,960; head MemAvailable 3.65-4.91 GiB; worker 5.41-6.88 GiB; 348 turns, 0 errors;
+#           median turn 31.2 s; cached/prompt tokens 0.934
+#   =1:     kept_bytes 1,042,595,840; head 7.59-8.39 GiB; worker 9.40-9.70 GiB; 352 turns, 0 errors;
+#           median turn 30.8 s; cached/prompt tokens 0.934
+# Those agents kept extending the same chats, so the recent state was reused. A return to an older chat can miss the
+# cache at 1 GiB. How much of the ~4 GiB is the kept states themselves is unconfirmed (the reporter says so). This
+# fork has not remeasured it, and its own default PARALLEL is 4. Issue #23's step 3 names the author's 4 as the
+# default to adopt after a local run that still reuses the cache and frees 2 GiB or more; that run is not this
+# measurement, so 4 stays an override, not the default. 0 is no cap. TF_GLM_KEEP_PER_CHAT stays 0 (no per-chat limit;
+# the author runs 2): one long chat can fill the entries alone until that combination is measured the same way.
 # /health shows kept_bytes, kept_bytes_cap and kept_mix.
-export TF_GLM_KEPT_BYTES_GIB="${TF_GLM_KEPT_BYTES_GIB:-0}"
+export TF_GLM_KEPT_BYTES_GIB="${TF_GLM_KEPT_BYTES_GIB:-1}"
 export TF_GLM_KEEP_PER_CHAT="${TF_GLM_KEEP_PER_CHAT:-0}"
 # TF_GLM_KEEP_REASONING (patch 0036; not set here, so TensorFold's default stands: 1024 kept replies,
 # TF_GLM_KEEP_REASONING_MB 32). 0 turns restoration off. Opt-in workaround when a long agent session stalls in
