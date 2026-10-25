@@ -42,6 +42,8 @@ jobs:
           PYTHONPATH=/tmp/tf/src python tools/reply_ids_check.py "$MD"
       - name: Start-up budget counts the parked pages (synthetic zoneinfo)
         run: PYTHONPATH=/tmp/tf/src python tools/parked_pages_check.py
+      - name: Picture budget keeps every picture's cap
+        run: PYTHONPATH=/tmp/tf/src python tools/picture_budget_check.py "$PWD"
       - name: iPhone MPO JPEG decodes as frame 0
         run: |
           python -m pip install --disable-pip-version-check pillow
