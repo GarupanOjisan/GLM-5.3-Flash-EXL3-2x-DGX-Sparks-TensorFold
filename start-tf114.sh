@@ -12,6 +12,7 @@
 #   DRY_RUN=1 TF114_IMAGE=example:1.1.4 ./start-tf114.sh    # print the docker arguments and exit (no ssh, no docker)
 #   TF114_RECALL=1                                          # add --recall on both ranks
 #   TF114_COMM_PORT (default 29583)                         # NCCL_COMM_ID's port on the link
+#   FOREGROUND=1 ./start-tf114.sh                           # stay on rank 0's log, exit with its code (systemd unit)
 # With PARALLEL above 1 and no CONTEXT in the environment, the window is 262144, as ./start-native.sh: a whole window
 # per request. MiaAI-Lab issue #208: compare this lane with ./start.sh only at the same PARALLEL and DENSE.
 set -euo pipefail
@@ -20,6 +21,7 @@ _ctx_env="${CONTEXT:-}"
 source ./scripts/config.sh
 source ./scripts/tf114-env.sh
 source ./scripts/nodes.sh
+source ./scripts/foreground.sh
 
 tf114_check_copy
 MODE="${1:-start}"
@@ -128,6 +130,10 @@ worker 1 "$remote" >/dev/null || die "could not start rank 1 on $WORKER"
 log "Rank 0 here"
 docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" $(rank_env 0) $(rank_nccl_env 0) \
   -v "$HF_CACHE":/root/.cache/huggingface --entrypoint tensorfold "$TF114_IMAGE" "${SERVE[@]}" >/dev/null
+if [[ "${FOREGROUND:-0}" == 1 ]]; then
+  log "FOREGROUND=1: attached to rank 0's log; either rank ending stops the other"
+  ranks_foreground
+fi
 
 log "3. Load"
 for _ in $(seq 1 120); do

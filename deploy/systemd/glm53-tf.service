@@ -1,0 +1,38 @@
+# Both ranks of GLM-5.3-Flash as one systemd service (upstream issue #227). The unit runs rank 0's launcher in the
+# foreground (FOREGROUND=1): when either rank ends, the launcher stops the other one and exits non-zero, and systemd
+# starts both again. Do not give the containers a Docker restart policy: a TP rank restarted alone waits forever.
+#
+# Install (README "Run as a systemd service"): copy to /etc/systemd/system/glm53-tf.service, set User= and
+# WorkingDirectory= (and the launcher, see ExecStart=), put settings such as TF114_IMAGE in /etc/default/glm53-tf, then
+#   sudo systemctl daemon-reload && sudo systemctl enable --now glm53-tf
+# Restart with `sudo systemctl restart glm53-tf`, not by restarting one container. Before a script that stops or swaps
+# the containers itself (a night swap, an evaluation), `sudo systemctl stop glm53-tf`; afterwards `start` it again.
+[Unit]
+Description=GLM-5.3-Flash on two DGX Sparks (TensorFold, both ranks)
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+# A launch that keeps failing (a missing image, a worker that is down) stops after 3 tries in 30 minutes.
+StartLimitIntervalSec=1800
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# The user who owns the repository, with ssh keys for the worker and access to docker
+User=CHANGE_ME
+WorkingDirectory=/home/CHANGE_ME/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+EnvironmentFile=-/etc/default/glm53-tf
+Environment=FOREGROUND=1
+ExecStartPre=/usr/bin/env ./stop.sh
+# start-tf114.sh (TensorFold v1.1.x, TF114_IMAGE in /etc/default/glm53-tf); ./start-native.sh or ./start.sh work the same
+ExecStart=/usr/bin/env ./start-tf114.sh start
+ExecStop=/usr/bin/env ./stop.sh
+Restart=on-failure
+RestartSec=30
+# Loading the weights on both ranks takes about 4 minutes; the kernels' first compile for an image takes longer.
+TimeoutStartSec=1800
+TimeoutStopSec=120
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

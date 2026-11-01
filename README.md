@@ -305,6 +305,30 @@ typo leaves it running (running requests are cut off; `stop.sh` warns). Extra ar
 both ranks after the defaults, so they win (`./start.sh restart --max-tokens 16384`); `./start.sh --help` lists all.
 `FOREGROUND=1 ./start.sh` stays attached to rank 0's log and exits with its exit code (for a systemd unit), without
 the progress lines, the window retry or the smoke test; when either rank ends, it stops the other one.
+`./start-tf114.sh` and `./start-native.sh` take `FOREGROUND=1` the same way (`scripts/foreground.sh`).
+
+### Run as a systemd service
+
+`deploy/systemd/glm53-tf.service` keeps both ranks up: when a rank exits (a crash, or the watchdog's
+`TF_GLM_MULTI_WATCHDOG_EXIT=1`), the launcher stops the other rank and exits non-zero, and systemd starts both again
+after 30 seconds (at most 3 tries in 30 minutes).
+
+```bash
+sudo cp deploy/systemd/glm53-tf.service /etc/systemd/system/
+sudo systemctl edit --full glm53-tf          # set User= and WorkingDirectory=; ExecStart= picks the launcher
+echo 'TF114_IMAGE=<image>' | sudo tee /etc/default/glm53-tf
+sudo systemctl daemon-reload && sudo systemctl enable --now glm53-tf
+journalctl -u glm53-tf -f                    # rank 0's log
+```
+
+- Restart with `sudo systemctl restart glm53-tf`. Do not restart one container by hand, and do not give the containers
+  a Docker restart policy: a rank restarted alone waits for its peer forever.
+- A script that stops or swaps the containers itself (a night swap, an evaluation run) fights the unit, which would
+  start them again. Run `sudo systemctl stop glm53-tf` before it and `sudo systemctl start glm53-tf` after it. An
+  outside health check should leave the server alone while `systemctl is-active glm53-tf` says `active` or
+  `activating`.
+- Worth checking once on your Sparks: rank 0 killed, rank 1 killed, the head rebooted, and the worker out of reach
+  for a minute (both ranks should come back in the first three cases, and nothing should stop in the last).
 
 **`scripts/prepare.sh`** does the one-time setup, and is safe to re-run (each step skips work already done):
 
