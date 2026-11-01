@@ -8,12 +8,14 @@
 # together (default 4 with DRAFTER=dflash2, as ./start.sh); CONTEXT defaults to 262144 then (four lanes' caches fit),
 # 1048576 at PARALLEL=1. DRAFTER=dflash2 (the default) or mtp, COPY as ./start.sh.
 # Usage: ./start-native.sh [start|restart]     Env: as ./start.sh (scripts/config.sh), NATIVE_IMAGE, NATIVE_PORT_RANKS
+# FOREGROUND=1 ./start-native.sh stays on rank 0's log and exits with its code (scripts/foreground.sh, systemd unit).
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 _ctx_env="${CONTEXT:-}"
 source ./scripts/config.sh
 source ./scripts/tf114-env.sh
 source ./scripts/nodes.sh
+source ./scripts/foreground.sh
 tf114_check_copy
 
 MODE="${1:-start}"
@@ -87,6 +89,10 @@ rank0=(tensorfold-native serve "$MODEL_ARG" --host "$HOST" --port "$PORT" --name
 log "Rank 0 here: ${rank0[*]}"
 docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}" $(rank_nccl_env 0) \
   -v "$HF_CACHE":/root/.cache/huggingface --entrypoint "${rank0[0]}" "$NATIVE_IMAGE" "${rank0[@]:1}" >/dev/null
+if [[ "${FOREGROUND:-0}" == 1 ]]; then
+  log "FOREGROUND=1: attached to rank 0's log; either rank ending stops the other"
+  ranks_foreground
+fi
 
 log "4. Load (about 2 minutes)"
 for _ in $(seq 1 120); do

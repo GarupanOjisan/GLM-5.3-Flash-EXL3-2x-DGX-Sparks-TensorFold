@@ -111,6 +111,11 @@ jobs:
         run: |
           bash -n scripts/prepare.sh scripts/snapshot.sh
           bash tests/test_verify_snapshot.sh
+      - name: FOREGROUND=1 keeps both ranks together
+        run: |
+          bash -n scripts/foreground.sh start-tf114.sh start-native.sh
+          bash tests/test_foreground.sh
+          grep -q '^Restart=on-failure' deploy/systemd/glm53-tf.service
       - name: Image pin matches the patch set
         run: |
           # image_hash() from scripts/config.sh: sha256(cat patches/*.patch + IMAGE_EXTRAS)[:12]
