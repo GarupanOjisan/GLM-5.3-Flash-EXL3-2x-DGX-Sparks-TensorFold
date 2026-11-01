@@ -930,6 +930,24 @@ Which path reads which knob:
 `TF_GLM_COPY` is used, and otherwise `TF_GLM_COPY_DRAFTS`. When both a recipe name and its alias are set, the recipe
 name wins (`COPY`, `COPY_MAX`, `COPY_CODE`).
 
+### Structured outputs on the v1.1.x lane
+
+Since v1.1.3, `tensorfold serve` loads `libtfgrammar.so` (xgrammar v0.2.8, Apache-2.0) from `../lib` beside its binary,
+so in the image it is `/opt/tensorfold/lib/libtfgrammar.so`. Without it, `tool_choice: "required"`, a named function
+and `response_format: {"type": "json_schema", ...}` get HTTP 400, the log says `libtfgrammar.so is required ...`, and
+other requests (`tool_choice: "auto"` too) work as before. `./start-tf114.sh` warns when `TF114_IMAGE` has no such file.
+
+Build it from the same TensorFold tree as the binary, with the Zig and container the binary was built with:
+
+```bash
+git clone --branch v0.2.8 --recurse-submodules https://github.com/mlc-ai/xgrammar /w/xgrammar
+zig build -Doptimize=ReleaseFast -Dnvcc=/usr/local/cuda/bin/nvcc --prefix /w/out install native grammar -Dxgrammar=/w/xgrammar
+# /w/out/native/lib/libtfgrammar.so; in the image's Dockerfile: COPY lib/ /opt/tensorfold/lib/
+```
+
+A release archive's `lib/libtfgrammar.so` works only with that release's binary. `./start-native.sh` (TensorFold
+1.0.2) has no structured outputs and its tree no `grammar` step, so `scripts/native-image.sh` does not add the library.
+
 Measured on the Python path (the numbers in `scripts/config.sh`; not remeasured on v1.1.4):
 
 - `COPY` on (patch 0007): quote / edit replies +5% (80.3 -> 84.4 tok/s), prose and code unchanged. Exact.

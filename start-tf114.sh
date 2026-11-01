@@ -8,6 +8,9 @@
 # effect when GarupanOjisan/TensorFold's companion change reads them. Until then the engine ignores them.
 #
 # This recipe does not build a v1.1.4 image. Set TF114_IMAGE to the container you run.
+# The image needs /opt/tensorfold/lib/libtfgrammar.so beside /opt/tensorfold/bin (README "Structured outputs on the
+# v1.1.x lane"). Without it, tool_choice "required", a named function and response_format json_schema get HTTP 400;
+# other requests still work. The launch warns when the image has no such file.
 #   TF114_IMAGE=<image> ./start-tf114.sh [start|restart]
 #   DRY_RUN=1 TF114_IMAGE=example:1.1.4 ./start-tf114.sh    # print the docker arguments and exit (no ssh, no docker)
 #   TF114_RECALL=1                                          # add --recall on both ranks
@@ -97,6 +100,11 @@ fi
 
 need_workers
 log "1. Image $TF114_IMAGE"
+docker image inspect "$TF114_IMAGE" >/dev/null 2>&1 || die "no image $TF114_IMAGE here"
+if ! docker run --rm --entrypoint ls "$TF114_IMAGE" /opt/tensorfold/lib/libtfgrammar.so >/dev/null 2>&1; then
+  warn "$TF114_IMAGE has no /opt/tensorfold/lib/libtfgrammar.so: tool_choice \"required\", named functions and json_schema" \
+       "outputs will get HTTP 400 (README \"Structured outputs on the v1.1.x lane\")"
+fi
 detect_links
 log "Link: $HEAD_ADDR ($HEAD_DEV) <-> $WORKER_ADDR ($WORKER_DEV), RoCE $HEAD_HCAS / $WORKER_HCAS"
 comm_id="${LINK_HEAD_ADDR[1]}:$COMM_PORT"
