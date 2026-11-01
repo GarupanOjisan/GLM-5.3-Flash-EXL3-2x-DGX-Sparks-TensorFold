@@ -17,6 +17,7 @@ set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."     # the repository root
 source ./scripts/config.sh
 source ./scripts/nodes.sh
+source ./scripts/snapshot.sh
 
 REBUILD=0
 for arg in "$@"; do
@@ -244,14 +245,18 @@ for id in "${models[@]}"; do
   pin=$(model_revision "$id"); dir=$(model_cache_dir "$id")
   log "Downloading $id${pin:+ @ ${pin:0:8}} into $HF_CACHE/hub (resumes if interrupted)"
   if ! download "$id" "$pin"; then
-    # no network: a pinned snapshot already here is enough (serving reads the local cache only)
+    # no network: a pinned snapshot already here is enough (serving reads the local cache only), if it is complete
     [[ -n "$pin" && -f "$dir/snapshots/$pin/config.json" ]] || die "$id: the download failed"
+    verify_snapshot "$dir" "$pin" ||
+      die "$id: the download failed and the snapshot here (${pin:0:8}) is incomplete; run ./scripts/prepare.sh again to resume it"
     warn "$id: could not reach Hugging Face; using the snapshot already here (${pin:0:8})"
   fi
   # a download by commit sha writes no refs/main: name the pin there when nothing else is (tools that take repo ids)
   [[ -z "$pin" || -f "$dir/refs/main" ]] || { mkdir -p "$dir/refs"; printf %s "$pin" > "$dir/refs/main"; }
   rev=$(snapshot_rev "$id")
   [[ -n "$rev" && -d "$dir/snapshots/$rev" ]] || die "$id: no snapshot${rev:+ $rev} after the download"
+  verify_snapshot "$dir" "$rev" ||
+    die "$id @ ${rev:0:8} is incomplete after the download (above); run ./scripts/prepare.sh again to resume it"
   log "Checkpoint: $dir/snapshots/$rev ($(du -shL "$dir/snapshots/$rev" | cut -f1))"
 done
 
@@ -265,6 +270,10 @@ info=$(docker run --rm --entrypoint tensorfold -e HF_HUB_OFFLINE=1 -v "$HF_CACHE
 printf '%s\n' "$info" | grep -v "EXL3 support is experimental" || true
 
 # ---------------------------------------------------------------- 6. the same files on the workers
+# the head's snapshots once more before anything is sent: a worker never gets a partial checkpoint (issue #225)
+for id in "${models[@]}"; do
+  verify_snapshot "$(model_cache_dir "$id")" "$(snapshot_rev "$id")" || die "$id: the head's snapshot is incomplete (above)"
+done
 # The manifests below ("<file> <size>" a line) are sorted in byte order on both sides (LC_ALL=C, also inside the
 # commands sent over ssh, which carries no locale of ours): each host's own collation would order the same files
 # differently (issue #21). On a mismatch, the first differing lines show what differs.
