@@ -175,6 +175,9 @@ cp scripts/local.sh.example scripts/local.sh     # set WORKER=user@192.0.2.2 in 
 ./start.sh
 ```
 
+`scripts/local.sh` and `.env` can hold `HF_TOKEN` and your own addresses: `.gitignore` keeps them (and `*.log`)
+out of commits.
+
 `WORKER` is the worker's ssh target. The ranks talk over the route to it: if it is on another network than the link,
 set `FABRIC_PEER` to the worker's CX7 address. The worker needs no copy of this repository.
 
@@ -316,6 +319,9 @@ the progress lines, the window retry or the smoke test; when either rank ends, i
 4. The checkpoint, and DFlash2 with `DRAFTER=dflash2`, downloaded into `~/.cache/huggingface` on the head at their
    pinned revisions (the checkpoint checked with `tensorfold info`), then copied to the worker with `rsync` over ssh
    and checked file by file. Both resume.
+   Before the copy, every snapshot is checked complete (`scripts/snapshot.sh`: every shard that
+   `model.safetensors.index.json` names, no broken link, no blob still `*.incomplete`). A download that stopped part
+   way makes `prepare.sh` fail and name what is missing; run `./scripts/prepare.sh` again and it downloads the rest.
 
 ```bash
 scripts/prepare.sh             # set up both Sparks without starting the server

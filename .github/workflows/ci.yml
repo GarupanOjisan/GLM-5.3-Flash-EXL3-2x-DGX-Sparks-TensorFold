@@ -107,6 +107,10 @@ jobs:
           printf '%s\n' "$out" | grep -q "nothing was started"
           # 1.0.2's launcher forwards the same copy names
           grep -q 'TF114_COPY_VARS' start-native.sh
+      - name: prepare.sh refuses an incomplete snapshot
+        run: |
+          bash -n scripts/prepare.sh scripts/snapshot.sh
+          bash tests/test_verify_snapshot.sh
       - name: Image pin matches the patch set
         run: |
           # image_hash() from scripts/config.sh: sha256(cat patches/*.patch + IMAGE_EXTRAS)[:12]
